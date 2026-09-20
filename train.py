@@ -26,6 +26,7 @@ from murre.pipeline import MurrePipeline
 from murre.training_dataset import MurreNormalTrainingDataset, ResolutionBatchSampler
 from murre.util.metric3d_normal import Metric3DNormalEstimator
 from murre.util.normal_util import camera_normal_consistency_loss
+from murre.validation import ValidationPreview
 
 
 def seed_everything(seed: int):
@@ -213,7 +214,7 @@ def build_parser():
     parser.add_argument(
         "--work_resolution",
         type=int,
-        default=1024,
+        default=384,
         help=(
             "Longest edge of the working image before the random crop; RGB, depth, "
             "intrinsics use this grid before augmentation. Online Metric3D uses the final crop. 0 disables."
@@ -236,7 +237,7 @@ def build_parser():
         default=1.5,
         help="Multiplier applied to the auto quantile cap.",
     )
-    parser.add_argument("--crop_scale_min", type=float, default=0.6)
+    parser.add_argument("--crop_scale_min", type=float, default=0.9)
     parser.add_argument("--crop_scale_max", type=float, default=1.0)
     parser.add_argument("--random_flip", action="store_true")
     parser.add_argument(
@@ -267,7 +268,7 @@ def build_parser():
     parser.add_argument(
         "--metric3d_max_edge",
         type=int,
-        default=1024,
+        default=1064,
         help="Longest edge passed to Metric3D.",
     )
     parser.add_argument(
@@ -355,6 +356,12 @@ def build_parser():
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--tensorboard_dir", default=None, help="Default: OUTPUT_DIR/tensorboard")
     parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--val_on_start", action="store_true", help="Run previews before the first optimizer update")
+    parser.add_argument("--val_every", type=int, default=500, help="0 disables inference previews")
+    parser.add_argument("--val_samples", type=int, default=3)
+    parser.add_argument("--val_index", default=None, help="Separate index; default is training previews, not held-out validation")
+    parser.add_argument("--val_resolution", default="192x256")
+    parser.add_argument("--val_denoising_steps", type=int, default=4)
     return parser
 
 
@@ -386,6 +393,11 @@ def main():
             "the training target and is intended for ablations only."
         )
 
+    if args.val_every < 0 or args.val_samples < 1 or args.val_denoising_steps < 1:
+        parser.error("Invalid validation frequency, sample count or denoising steps")
+    val_size = tuple(map(int,args.val_resolution.lower().split('x')))
+    if len(val_size) != 2 or min(val_size) < 32 or any(v%8 for v in val_size):
+        parser.error("--val_resolution must be HxW, >=32 and divisible by 8")
     resolutions = [tuple(map(int, item.lower().split('x'))) for item in args.resolutions]
     if any(len(size)!=2 or min(size)<32 or any(v%8 for v in size) for size in resolutions):
         parser.error('--resolutions must be HxW, >=32 and divisible by 8')
@@ -564,12 +576,18 @@ def main():
         global_step = int(state.get("global_step", 0))
         logging.info("Resumed optimizer state at global_step=%d", global_step)
 
+    preview = None
     tb_dir = args.tensorboard_dir or os.path.join(args.output_dir, "tensorboard")
     logging.info("TensorBoard directory: %s", tb_dir)
     # Close/flush on normal exit, exceptions, and Ctrl+C. Remove stale future
     # events when resuming an older checkpoint into the same log directory.
     with SummaryWriter(tb_dir, purge_step=global_step + 1 if args.resume else None) as writer:
         writer.add_text("config", json.dumps(vars(args), indent=2), global_step)
+        if args.val_every and args.val_on_start:
+            logging.info("Running initial evaluation at step %d", global_step)
+            preview = ValidationPreview(dataset, normal_predictor, args.output_dir,
+                count=args.val_samples, size=val_size, index=args.val_index)
+            preview.run(pipe, writer, global_step, args.val_denoising_steps, args.precision)
         optimizer.zero_grad(set_to_none=True)
         data_iter = iter(dataloader)
         micro_step = 0
@@ -766,6 +784,12 @@ def main():
                 writer.flush()
                 running_total = running_diff = running_normal = 0.0
                 running_count = 0
+
+            if args.val_every and (global_step % args.val_every == 0 or global_step == args.max_steps):
+                if preview is None:
+                    preview = ValidationPreview(dataset, normal_predictor, args.output_dir,
+                        count=args.val_samples, size=val_size, index=args.val_index)
+                preview.run(pipe, writer, global_step, args.val_denoising_steps, args.precision)
 
             if args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(

@@ -15,6 +15,8 @@ environment). Failures raise an actionable error instead of falling back silentl
 from __future__ import annotations
 
 import math
+import logging
+import cv2
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -129,7 +131,7 @@ class Metric3DNormalEstimator:
         config: Metric3D config with the RAFT depth+normal head.
         metric3d_root: Directory containing the vendored Metric3D package.
         device: Torch device string; ``cpu`` avoids competing with the UNet for VRAM.
-        max_edge: Longest edge fed to Metric3D (original aspect ratio preserved).
+        max_edge: Canvas longest edge; default 1064 gives official 616x1064 resize/pad.
         depth_scale: Multiplies the predicted depth (e.g. ``0.001`` for mm -> m).
     """
 
@@ -139,7 +141,7 @@ class Metric3DNormalEstimator:
         config: Optional[str] = None,
         metric3d_root: Optional[str] = None,
         device: str = "cuda",
-        max_edge: int = 1024,
+        max_edge: int = 1064,
         depth_scale: float = 1.0,
     ):
         root, config_path, checkpoint_path = resolve_metric3d_paths(
@@ -149,12 +151,25 @@ class Metric3DNormalEstimator:
 
         cfg = Config.fromfile(str(config_path))
         model = build_model(cfg)
-        model, _, _, _ = load_ckpt(str(checkpoint_path), model, strict_match=False)
+        weights = torch.load(str(checkpoint_path), map_location="cpu")["model_state_dict"]
+        result = model.load_state_dict(weights, strict=False)
+        missing = set(result.missing_keys) - {"depth_model.encoder.mask_token"}
+        if missing or result.unexpected_keys:
+            raise RuntimeError(f"Metric3D checkpoint mismatch: missing={sorted(missing)}, unexpected={result.unexpected_keys}")
+        del weights
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(
                 "Metric3D normal prior requested device=cuda but CUDA is unavailable."
             )
+        if self.device.type == "cpu":
+            # Installed xFormers has no CPU attention kernel. Bind the upstream
+            # PyTorch fallback only on this predictor's attention instances.
+            from types import MethodType
+            from mono.model.backbones.ViT_DINO_reg import MemEffAttention, Attention
+            for layer in model.modules():
+                if isinstance(layer, MemEffAttention):
+                    layer.forward = MethodType(Attention.forward, layer)
         model.eval().to(self.device)
         model.requires_grad_(False)
         _register_device_depth_anchor(model, self.device)
@@ -162,30 +177,33 @@ class Metric3DNormalEstimator:
         self.max_edge = int(max_edge)
         self.depth_scale = float(depth_scale)
         self.checkpoint_path = checkpoint_path
+        factor = float(max_edge) / 1064 if max_edge > 0 else 1.0
+        self.input_size = (max(28, round(616*factor/28)*28), max(28, round(1064*factor/28)*28))
+        self.cache_signature = dict(preprocessing="metric3d-letterbox-v2", input_size=list(self.input_size),
+            checkpoint=str(checkpoint_path), checkpoint_mtime=checkpoint_path.stat().st_mtime_ns)
+        if self.input_size != (616,1064):
+            logging.warning("Metric3D input %s differs from official 616x1064; small sizes can collapse normals",self.input_size)
 
-    def _prepare_input(self, rgb: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]:
+    def _prepare_input(self, rgb: np.ndarray):
         if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(f"Expected an HxWx3 RGB image, got shape {tuple(rgb.shape)}")
-        height, width = int(rgb.shape[0]), int(rgb.shape[1])
-        target_h, target_w = _align_size(height, width, self.max_edge)
-        if (target_h, target_w) != (height, width):
-            resized = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)[None]
-            resized = F.interpolate(
-                resized.float(), size=(target_h, target_w), mode="bilinear", align_corners=False
-            )
-            tensor = resized[0]
-        else:
-            tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float()
-
-        mean = torch.tensor(_MEAN, dtype=torch.float32)[:, None, None]
-        std = torch.tensor(_STD, dtype=torch.float32)[:, None, None]
-        tensor = ((tensor - mean) / std).unsqueeze(0).to(self.device)
-        return tensor, (height, width), (target_h, target_w)
+            raise ValueError(f"Expected HxWx3 RGB, got {rgb.shape}")
+        height,width = rgb.shape[:2]
+        target_h,target_w = self.input_size
+        scale = min(target_h/height,target_w/width)
+        new_h,new_w = max(1,int(height*scale)),max(1,int(width*scale))
+        resized = cv2.resize(rgb,(new_w,new_h),interpolation=cv2.INTER_LINEAR)
+        top,left = (target_h-new_h)//2,(target_w-new_w)//2
+        padded = cv2.copyMakeBorder(resized,top,target_h-new_h-top,left,target_w-new_w-left,
+            cv2.BORDER_CONSTANT,value=_MEAN)
+        tensor = torch.from_numpy(np.ascontiguousarray(padded)).permute(2,0,1).float()
+        mean = torch.tensor(_MEAN)[:,None,None]
+        std = torch.tensor(_STD)[:,None,None]
+        return ((tensor-mean)/std)[None].to(self.device), (height,width), (top,left,new_h,new_w)
 
     @torch.inference_mode()
     def predict(self, rgb: np.ndarray) -> dict:
         """Predict ``depth`` [H, W] and camera-space ``normal`` [H, W, 3] for one image."""
-        tensor, original_hw, _ = self._prepare_input(rgb)
+        tensor, original_hw, (top,left,new_h,new_w) = self._prepare_input(rgb)
         _, _, output = self.model.inference({"input": tensor})
 
         if "prediction_normal" not in output:
@@ -196,6 +214,8 @@ class Metric3DNormalEstimator:
         normal = output["prediction_normal"][:, :3].float()
         depth = output["prediction"][:, :1].float()
 
+        normal = normal[:,:,top:top+new_h,left:left+new_w]
+        depth = depth[:,:,top:top+new_h,left:left+new_w]
         normal = F.interpolate(normal, size=original_hw, mode="bilinear", align_corners=False)
         depth = F.interpolate(depth, size=original_hw, mode="bilinear", align_corners=False)
 

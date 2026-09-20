@@ -83,7 +83,7 @@ before being resized to a randomly selected `--resolutions` size. All samples in
 Default:
 
 ```text
-crop_scale_min = 0.6
+crop_scale_min = 0.9
 crop_scale_max = 1.0
 resolutions = 128x192 192x256 256x384
 ```
@@ -286,6 +286,94 @@ normal、加权 normal loss、学习率和当前图像尺寸。loss 是上次记
 
 在项目根目录运行：
 ```bash
-.tools/murre-env/bin/tensorboard --logdir output/murre-normal-prior/tensorboard --port 6006
+LOGDIR=output/murre-normal-prior/tensorboard bash Murre-with-normal-prior/tensorboard.sh
 ```
 浏览器打开 `http://localhost:6006`。训练正在运行时也可查看。
+
+## 验证预览
+
+默认 `VAL_EVERY=500 VAL_SAMPLES=3 VAL_RESOLUTION=192x256 VAL_DENOISING_STEPS=4`。
+每隔指定步数以及训练最后一步，用固定样本、固定遮挡和随机种子进行完整去噪推理。
+`VAL_EVERY=0` 关闭。推理时切换到 eval/no-grad，结束后恢复训练模式和随机状态。
+
+保存到 `OUTPUT_DIR/validation/step-0000500/sample-00.png` 等路径，
+每张图从左到右是 RGB、输入 depth、Metric3D normal、预测 depth、预测 depth 转换的 normal、GT depth。
+三个 depth 面板共用 GT 有效深度 2%–98% 分位数色标，黑色表示无效像素。
+预测不使用 GT latent，不进行 GT 对齐。每次的数值误差保存为 `metrics.json`；
+RMSE 使用原始存储单位，仅逐样本记录，混合单位数据集不汇总 RMSE。
+固定样本和 normal 缓存在 `validation/samples.pt`，恢复时复用。
+
+默认是训练样本的定性预览，TensorBoard 标签为 `train_preview/*`，并非独立验证成绩。
+如需独立验证，先按场景拆分训练/验证 TXT，传 `VAL_INDEX=/path/to/val.txt`；
+代码拒绝训练/验证场景重叠。标签为 `validation/*`。验证还会记录平均 AbsRel 和对比图。
+修改样本数量、尺寸或索引时，请使用新输出目录，或移走旧 `validation/samples.pt` 重新选样。
+当前在跑的进程不会热加载这些改动，需要从完整 checkpoint 恢复后生效。
+
+## TensorBoard 环境兼容
+
+`3dgs` 中 TensorBoard 2.14 + protobuf 5.29 会触发
+`MessageToJson(... including_default_value_fields ...)` 错误。
+本机已将该环境 protobuf 调整为 4.25.8；以后重新安装时可执行：
+`python -m pip install protobuf==4.25.8`。无需安装 TensorFlow。
+也可直接使用独立启动脚本（调用训练 Python 的 TensorBoard 模块）：
+
+```bash
+LOGDIR=output/murre-normal-prior-b16/tensorboard \
+bash Murre-with-normal-prior/tensorboard.sh
+```
+
+已运行的 TensorBoard 服务需要停止后重新启动。验证 PNG 也可直接打开，不依赖 TensorBoard。
+
+## 保留较大视野的缩放裁剪
+
+默认顺序：原始 RGB/depth → 等比例缩放（最长边 384，不放大小图）→
+按目标宽高比随机裁剪（最大可用裁剪框边长的 90%–100%）→ 调整到该 batch 的训练尺寸。
+相机内参同步缩放并减去裁剪偏移，在线 Metric3D 使用最终 RGB。
+宽高比接近时约保留原图 81%–100% 面积；宽高比差异仍会损失一部分视野。
+缩放本身不扩大视野，提高裁剪比例才会减少局部取景。
+
+```bash
+WORK_RESOLUTION=384 CROP_SCALE_MIN=0.9 CROP_SCALE_MAX=1.0 \
+bash Murre-with-normal-prior/train_murre-normal-prior.sh
+```
+
+`CROP_SCALE_MIN=1 CROP_SCALE_MAX=1` 保留目标宽高比允许的最大裁剪框。
+当前进程需要重启/恢复才使用新设置。验证已经缓存的样本不会自动改变；如需重新取样，
+先移走 `OUTPUT_DIR/validation/samples.pt`，避免拿不同视野的预览作直接对比。
+
+## 自动续训和启动验证
+
+脚本默认 `AUTO_RESUME=1 VAL_ON_START=1`，查找输出目录中保存完成的 checkpoint
+（包括 final），按训练状态文件保存时间选择最近一个。显式 `RESUME` 优先。
+找不到任何 checkpoint 时从预训练模型开始；存在不完整保存记录时直接提示错误。
+启动后先在恢复步数执行一次预览，再训练；随后仍按 `VAL_EVERY` 运行。
+`VAL_ON_START=0` 跳过启动预览，`VAL_EVERY=0` 关闭全部预览。
+从头训练请使用新的 `OUTPUT_DIR` 并设置 `AUTO_RESUME=0`。
+自动恢复不读取旧 train_args.json，当前脚本设置仍决定训练数据和目标总步数。
+
+预测 normal 使用 camera-Z 反投影及同步变换后的内参，与训练使用相同的叉乘顺序；
+normal RGB 编码为 `(n+1)/2`，与 Metric3D normal 面板一致。无效预测深度、
+无效四邻域和图像最外圈显示为黑色。PNG 和 TensorBoard 对比图均包含此面板。
+
+## Metric3D normal 输入尺度修复
+
+Metric3D ViT-L 默认使用官方 616×1064 画布：等比例缩放 RGB（小图也会上采样）、
+均值补边、归一化、预测后去补边，再将 normal 调回 Murre 的训练尺寸并归一化。
+`METRIC3D_MAX_EDGE=1064` 控制画布长边，与 `RESOLUTIONS` 是独立参数。
+先前直接输入约 192×256 的图像会使某些 normal 退化到近似 (0,0,-1)；
+不要继续用 392 作为正式训练默认。修复了模型输入，不只是调整显示色彩。
+
+验证缓存新增 `normal_metadata.json`，旧缓存或预处理设置变化时只重新计算 normal，
+保留原 RGB、GT、遮挡和相机内参。加载权重时也会检查漏加载参数，
+仅允许未使用的 encoder.mask_token 缺失。
+
+此修复同时影响训练条件和 normal loss 的监督目标。已经训练的 checkpoint 受旧先验影响，
+可以继续作为诊断实验，但正式对比建议用新的输出目录从原始 Murre 重新训练：
+
+```bash
+AUTO_RESUME=0 OUTPUT_DIR=output/murre-normal-prior-metric3d-fixed \
+bash Murre-with-normal-prior/train_murre-normal-prior.sh
+```
+
+Metric3D 使用较大画布后计算量、显存需求增加；显存不足可设 `METRIC3D_DEVICE=cpu`，
+在线预测会更慢。当前运行进程不会热加载修复，需要重启。
