@@ -65,9 +65,11 @@ Optional horizontal flipping can be enabled with `--random_flip`.
 
 ## Simulated incomplete depth input
 
-The dense GT depth is used as the complete target. A copy is made and random parts of the image borders are removed before it is used as the Murre depth condition.
+The dense GT depth is used as the complete target. A copy is made and random regions connected to the image borders are removed before it is used as the Murre depth condition.
 
-By default:
+The occluder is no longer restricted to axis-aligned rectangles. Every selected side is represented by a polygon whose inward boundary can be horizontal/vertical or oblique. With several selected sides, the resulting visible region can become a trapezoid, triangular wedge, or irregular polygon.
+
+Default:
 
 ```text
 occlusion_probability = 1.0
@@ -75,9 +77,16 @@ occlusion_min_ratio = 0.05
 occlusion_max_ratio = 0.25
 occlusion_min_sides = 1
 occlusion_max_sides = 4
+occlusion_slant_probability = 0.8
+occlusion_slant_max_delta = 0.25
+occlusion_min_visible_ratio = 0.15
 ```
 
-For every sample, 1-4 sides are randomly selected and an independently sampled border width is masked to zero.
+`occlusion_slant_probability` controls how often a selected border uses an oblique cutting line. Setting it to `0` exactly recovers straight border masks.
+
+`occlusion_slant_max_delta` controls the maximum difference between the two endpoints of the cutting line. For a top/bottom border this is measured as a fraction of image height; for a left/right border it is measured as a fraction of image width. Larger values create stronger diagonal wedges.
+
+`occlusion_min_visible_ratio` prevents combinations of several border masks from removing almost all valid depth. Aggressive masks are resampled internally before the sample is returned.
 
 The incomplete input depth then goes through Murre's original depth normalization, interpolation, and distance-map construction. `d_min` and `d_max` are estimated only from the depth that remains visible after masking. The complete GT depth is normalized with the same range and remains the diffusion target.
 
@@ -85,7 +94,7 @@ This creates the desired training situation:
 
 ```text
 complete RGB
-+ incomplete / border-occluded depth
++ incomplete / polygon-border-occluded depth
 + normal structural prior
 -> complete depth
 ```
@@ -132,7 +141,7 @@ For the normal term, the U-Net output is converted to predicted clean latent `x0
 
 Normal supervision follows the requested robust rule:
 
-- input-depth missing / border-masked pixels: **100% normal supervision**;
+- input-depth missing / masked pixels: **100% normal supervision**;
 - pixels where input depth remains visible: retain only the lowest normal-loss **90%** by default;
 - invalid GT/normal pixels are ignored.
 
@@ -158,6 +167,9 @@ python train.py \
   --occlusion_max_ratio 0.25 \
   --occlusion_min_sides 1 \
   --occlusion_max_sides 4 \
+  --occlusion_slant_probability 0.8 \
+  --occlusion_slant_max_delta 0.25 \
+  --occlusion_min_visible_ratio 0.15 \
   --batch_size 1 \
   --gradient_accumulation_steps 4 \
   --max_steps 10000 \
@@ -227,8 +239,10 @@ normal_keep_ratio = 0.9
 For simulated missing depth, useful first comparisons are
 
 ```text
-max border ratio = 0.10 / 0.20 / 0.30
-selected sides    = 1 / 1-2 / 1-4
+max border ratio        = 0.10 / 0.20 / 0.30
+selected sides          = 1 / 1-2 / 1-4
+slant probability       = 0.0 / 0.5 / 0.8 / 1.0
+slant max delta         = 0.0 / 0.10 / 0.25 / 0.40
 ```
 
 The key evaluation split should separately report errors inside the synthetically masked region and the still-observed region.
