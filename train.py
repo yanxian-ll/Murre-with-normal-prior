@@ -163,7 +163,7 @@ def parse_depth_scales(specs):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Marigold-style Murre fine-tuning with an online Metric3D normal prior."
+        description="Marigold-style Murre fine-tuning with a surface-normal prior."
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Original Murre checkpoint.")
     parser.add_argument("--resume", type=str, default=None, help="Resume from a saved checkpoint directory.")
@@ -251,6 +251,15 @@ def build_parser():
         type=int,
         default=256,
         help="Minimum valid GT-depth pixels for a frame to be usable.",
+    )
+    parser.add_argument(
+        "--min_gt_valid_ratio",
+        type=float,
+        default=0.9,
+        help=(
+            "Minimum fraction of finite positive GT-depth pixels. Checked both before "
+            "augmentation and after the final crop/resize; samples below it are skipped."
+        ),
     )
 
     parser.add_argument(
@@ -381,6 +390,8 @@ def main():
         parser.error("--index and --dataset_roots are mutually exclusive")
     if not (0.0 < args.normal_keep_ratio <= 1.0):
         parser.error("--normal_keep_ratio must be in (0, 1]")
+    if not (0.0 < args.min_gt_valid_ratio <= 1.0):
+        parser.error("--min_gt_valid_ratio must be in (0, 1]")
     if args.log_every < 1:
         parser.error("--log_every must be >= 1")
     if args.gradient_accumulation_steps < 1:
@@ -481,6 +492,7 @@ def main():
         metric3d_device=args.metric3d_device or device.type,
         max_retries=args.max_retries,
         min_valid_pixels=args.min_valid_pixels,
+        min_gt_valid_ratio=args.min_gt_valid_ratio,
     )
     loader_generator = torch.Generator().manual_seed(args.seed)
     dataloader = DataLoader(
@@ -503,6 +515,11 @@ def main():
         "Sampling policy: uniform dataset -> uniform scene -> uniform image; crop_scale=[%.2f, %.2f]",
         args.crop_scale_min,
         args.crop_scale_max,
+    )
+    logging.info(
+        "GT validity: min_ratio=%.3f min_pixels=%d; invalid GT is masked from diffusion and normal losses",
+        args.min_gt_valid_ratio,
+        args.min_valid_pixels,
     )
     logging.info(
         "Depth conditioning: work_resolution=%d max_depth_mode=%s quantile=%.2f scale=%.2f fixed_cap=%.2f per_dataset=%s default_scale=%.4g",
@@ -621,7 +638,10 @@ def main():
             else:
                 normal_prior = batch['normal'].to(device, non_blocking=True)
             sparse_observed = batch["sparse_observed"].to(device, non_blocking=True)
-            normal_valid = (gt_valid if normal_predictor is not None else batch["normal_valid"].to(device, non_blocking=True))
+            # Always use the dataset-provided GT-geometry mask. For gt_depth this also
+            # removes hole-adjacent normals; for Metric3D it prevents prior-only loss
+            # supervision where the dataset has no trustworthy GT geometry.
+            normal_valid = batch["normal_valid"].to(device, non_blocking=True)
             intrinsics = batch["intrinsics"].to(device, non_blocking=True)
             d_min = batch["d_min"].to(device, non_blocking=True)
             d_max = batch["d_max"].to(device, non_blocking=True)
@@ -685,6 +705,9 @@ def main():
                 else:
                     raise ValueError(f"Unsupported prediction type: {prediction_type}")
 
+                # GT depth holes never contribute to the diffusion loss. The mask is
+                # downsampled conservatively: any invalid source pixel invalidates the
+                # corresponding latent cell.
                 valid_down = valid_latent_mask(gt_valid, gt_latent.shape[-2:])
                 latent_sqerr = (model_pred.float() - diffusion_target.float()).pow(2)
                 valid_count = valid_down.sum().clamp_min(1)
