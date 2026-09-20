@@ -71,7 +71,14 @@ def _load_depth(path: str, scale: float) -> np.ndarray:
 
 
 def _load_normal(path: str) -> np.ndarray:
-    normal = _load_array(path).astype(np.float32)
+    ext = os.path.splitext(path)[1].lower()
+    # Preserve RGB channel order for encoded normal images. Depth arrays keep
+    # using OpenCV because 16-bit/float depth formats need unchanged loading.
+    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+        normal = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+    else:
+        normal = _load_array(path).astype(np.float32)
+
     if normal.ndim != 3:
         raise ValueError(f"Normal must be HxWx3 or 3xHxW, got {normal.shape} from {path}")
     if normal.shape[0] == 3 and normal.shape[-1] != 3:
