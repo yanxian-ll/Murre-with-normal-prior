@@ -3,6 +3,7 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 from diffusers import (
     AutoencoderKL,
     DDIMScheduler,
@@ -50,46 +51,28 @@ class MurreDepthOutput(BaseOutput):
 
 class MurrePipeline(DiffusionPipeline):
     """
-    Pipeline for monocular depth estimation using Murre.
+    Pipeline for monocular depth estimation using Murre with a surface-normal prior.
 
-    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
-    library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
+    The original Murre U-Net uses 13 input channels in this order:
+        RGB latent (4) + interpolated SfM depth latent (4) + distance map (1)
+        + noisy depth latent (4).
 
-    Args:
-        unet (`UNet2DConditionModel`):
-            Conditional U-Net to denoise the depth latent, conditioned on image latent.
-        vae (`AutoencoderKL`):
-            Variational Auto-Encoder (VAE) Model to encode and decode images and depth maps
-            to and from latent representations.
-        scheduler (`DDIMScheduler`):
-            A scheduler to be used in combination with `unet` to denoise the encoded image latents.
-        text_encoder (`CLIPTextModel`):
-            Text-encoder, for empty text embedding.
-        tokenizer (`CLIPTokenizer`):
-            CLIP tokenizer.
-        scale_invariant (`bool`, *optional*):
-            A model property specifying whether the predicted depth maps are scale-invariant. This value must be set in
-            the model config. When used together with the `shift_invariant=True` flag, the model is also called
-            "affine-invariant". NB: overriding this value is not supported.
-        shift_invariant (`bool`, *optional*):
-            A model property specifying whether the predicted depth maps are shift-invariant. This value must be set in
-            the model config. When used together with the `scale_invariant=True` flag, the model is also called
-            "affine-invariant". NB: overriding this value is not supported.
-        default_denoising_steps (`int`, *optional*):
-            The minimum number of denoising diffusion steps that are required to produce a prediction of reasonable
-            quality with the given model. This value must be set in the model config. When the pipeline is called
-            without explicitly setting `num_inference_steps`, the default value is used. This is required to ensure
-            reasonable results with various model flavors compatible with the pipeline, such as those relying on very
-            short denoising schedules (`LCMScheduler`) and those with full diffusion schedules (`DDIMScheduler`).
-        default_processing_resolution (`int`, *optional*):
-            The recommended value of the `processing_resolution` parameter of the pipeline. This value must be set in
-            the model config. When the pipeline is called without explicitly setting `processing_resolution`, the
-            default value is used. This is required to ensure reasonable results with various model flavors trained
-            with varying optimal processing resolution values.
+    This version appends a 3-channel camera-space/image-space normal prior:
+        RGB latent (4) + interpolated SfM depth latent (4) + distance map (1)
+        + noisy depth latent (4) + normal prior (3) = 16 channels.
+
+    Appending normals after the original 13 channels is deliberate: when an original
+    13-channel Murre checkpoint is loaded, all pretrained convolution weights are
+    copied unchanged and the three new normal-channel weights are initialized to zero.
+    The model therefore starts from the original Murre behavior and learns to use the
+    normal prior only during fine-tuning.
     """
 
     rgb_latent_scale_factor = 0.18215
     depth_latent_scale_factor = 0.18215
+    original_unet_in_channels = 13
+    normal_channels = 3
+    normal_unet_in_channels = original_unet_in_channels + normal_channels
 
     def __init__(
         self,
@@ -104,6 +87,11 @@ class MurrePipeline(DiffusionPipeline):
         default_processing_resolution: Optional[int] = None,
     ):
         super().__init__()
+
+        # Expand an original Murre U-Net from 13 -> 16 input channels while
+        # preserving every pretrained weight in the original 13 channels.
+        self._ensure_normal_conditioning_channels(unet)
+
         self.register_modules(
             unet=unet,
             vae=vae,
@@ -125,11 +113,128 @@ class MurrePipeline(DiffusionPipeline):
 
         self.empty_text_embed = None
 
+    @classmethod
+    def _ensure_normal_conditioning_channels(cls, unet: UNet2DConditionModel) -> None:
+        """Expand the first U-Net convolution from 13 to 16 input channels.
+
+        Existing 13-channel weights are copied exactly. The new normal-channel
+        weights are zero initialized so loading an old Murre checkpoint does not
+        perturb its initial prediction before fine-tuning.
+        """
+        conv_in = unet.conv_in
+        if conv_in.in_channels == cls.normal_unet_in_channels:
+            return
+
+        if conv_in.in_channels != cls.original_unet_in_channels:
+            raise ValueError(
+                "Unexpected Murre U-Net input channels: "
+                f"{conv_in.in_channels}. Expected either "
+                f"{cls.original_unet_in_channels} (original Murre) or "
+                f"{cls.normal_unet_in_channels} (Murre with normal prior)."
+            )
+
+        new_conv = nn.Conv2d(
+            in_channels=cls.normal_unet_in_channels,
+            out_channels=conv_in.out_channels,
+            kernel_size=conv_in.kernel_size,
+            stride=conv_in.stride,
+            padding=conv_in.padding,
+            dilation=conv_in.dilation,
+            groups=conv_in.groups,
+            bias=conv_in.bias is not None,
+            padding_mode=conv_in.padding_mode,
+        ).to(device=conv_in.weight.device, dtype=conv_in.weight.dtype)
+
+        with torch.no_grad():
+            new_conv.weight.zero_()
+            new_conv.weight[:, : cls.original_unet_in_channels].copy_(conv_in.weight)
+            if conv_in.bias is not None:
+                new_conv.bias.copy_(conv_in.bias)
+
+        unet.conv_in = new_conv
+        unet.register_to_config(in_channels=cls.normal_unet_in_channels)
+        logging.info(
+            "Expanded Murre U-Net input from 13 to 16 channels; "
+            "new normal-channel weights are zero initialized."
+        )
+
+    @staticmethod
+    def _prepare_normal(
+        input_normal: Union[Image.Image, np.ndarray, torch.Tensor],
+        target_size,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Convert a normal prior to normalized [1, 3, H, W] in [-1, 1]."""
+        if isinstance(input_normal, Image.Image):
+            normal = pil_to_tensor(input_normal.convert("RGB"))
+        elif isinstance(input_normal, np.ndarray):
+            normal = torch.from_numpy(input_normal)
+        elif isinstance(input_normal, torch.Tensor):
+            normal = input_normal
+        else:
+            raise TypeError(f"Unknown normal input type: {type(input_normal) = }")
+
+        if normal.ndim == 3:
+            if normal.shape[0] == 3:
+                normal = normal.unsqueeze(0)
+            elif normal.shape[-1] == 3:
+                normal = normal.permute(2, 0, 1).unsqueeze(0)
+            else:
+                raise ValueError(
+                    f"Normal must have 3 channels, got shape {tuple(normal.shape)}"
+                )
+        elif normal.ndim == 4:
+            if normal.shape[1] == 3:
+                pass
+            elif normal.shape[-1] == 3:
+                normal = normal.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(
+                    f"Normal must have 3 channels, got shape {tuple(normal.shape)}"
+                )
+        else:
+            raise ValueError(f"Unsupported normal shape: {tuple(normal.shape)}")
+
+        if normal.shape[0] != 1:
+            raise ValueError(
+                f"Pipeline expects one normal map per call, got batch {normal.shape[0]}"
+            )
+
+        normal = normal.to(torch.float32)
+        normal = torch.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Support common normal encodings: uint/float [0,255], float [0,1],
+        # or already-decoded float [-1,1].
+        n_min = float(normal.min())
+        n_max = float(normal.max())
+        if n_max > 2.0 or n_min < -1.5:
+            normal = normal / 127.5 - 1.0
+        elif n_min >= 0.0 and n_max <= 1.0:
+            normal = normal * 2.0 - 1.0
+
+        if tuple(normal.shape[-2:]) != tuple(target_size):
+            normal = F.interpolate(
+                normal,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        magnitude = torch.linalg.vector_norm(normal, dim=1, keepdim=True)
+        valid = magnitude > 1e-6
+        normal = torch.where(
+            valid,
+            normal / magnitude.clamp_min(1e-6),
+            torch.zeros_like(normal),
+        )
+        return normal.to(dtype)
+
     @torch.no_grad()
     def __call__(
         self,
         input_image: Union[Image.Image, torch.Tensor],
         input_sparse_depth: Union[np.ndarray],
+        input_normal: Union[Image.Image, np.ndarray, torch.Tensor],
         max_depth: float = 10.0,
         denoising_steps: Optional[int] = None,
         ensemble_size: int = 5,
@@ -137,55 +242,13 @@ class MurrePipeline(DiffusionPipeline):
         match_input_res: bool = True,
         resample_method: str = "bilinear",
         batch_size: int = 0,
-        model_dtype = torch.float32,
+        model_dtype=torch.float32,
         generator: Union[torch.Generator, None] = None,
         color_map: str = "Spectral",
         show_progress_bar: bool = True,
         ensemble_kwargs: Dict = None,
     ) -> MurreDepthOutput:
-        """
-        Function invoked when calling the pipeline.
-
-        Args:
-            input_image (`Image`):
-                Input RGB (or gray-scale) image.
-            denoising_steps (`int`, *optional*, defaults to `None`):
-                Number of denoising diffusion steps during inference. The default value `None` results in automatic
-                selection.
-            ensemble_size (`int`, *optional*, defaults to `10`):
-                Number of predictions to be ensembled.
-            processing_res (`int`, *optional*, defaults to `None`):
-                Effective processing resolution. When set to `0`, processes at the original image resolution. This
-                produces crisper predictions, but may also lead to the overall loss of global context. The default
-                value `None` resolves to the optimal value from the model config.
-            match_input_res (`bool`, *optional*, defaults to `True`):
-                Resize depth prediction to match input resolution.
-                Only valid if `processing_res` > 0.
-            resample_method: (`str`, *optional*, defaults to `bilinear`):
-                Resampling method used to resize images and depth predictions. This can be one of `bilinear`, `bicubic` or `nearest`, defaults to: `bilinear`.
-            batch_size (`int`, *optional*, defaults to `0`):
-                Inference batch size, no bigger than `num_ensemble`.
-                If set to 0, the script will automatically decide the proper batch size.
-            generator (`torch.Generator`, *optional*, defaults to `None`)
-                Random generator for initial noise generation.
-            show_progress_bar (`bool`, *optional*, defaults to `True`):
-                Display a progress bar of diffusion denoising.
-            color_map (`str`, *optional*, defaults to `"Spectral"`, pass `None` to skip colorized depth map generation):
-                Colormap used to colorize the depth map.
-            scale_invariant (`str`, *optional*, defaults to `True`):
-                Flag of scale-invariant prediction, if True, scale will be adjusted from the raw prediction.
-            shift_invariant (`str`, *optional*, defaults to `True`):
-                Flag of shift-invariant prediction, if True, shift will be adjusted from the raw prediction, if False, near plane will be fixed at 0m.
-            ensemble_kwargs (`dict`, *optional*, defaults to `None`):
-                Arguments for detailed ensembling settings.
-        Returns:
-            MurreDepthOutput`: Output class for Murre monocular depth prediction pipeline, including:
-            - **depth_np** (`np.ndarray`) Predicted depth map, with depth values in the range of [0, 1]
-            - **depth_colored** (`PIL.Image.Image`) Colorized depth map, with the shape of [3, H, W] and values in [0, 1], None if `color_map` is `None`
-            - **uncertainty** (`None` or `np.ndarray`) Uncalibrated uncertainty(MAD, median absolute deviation)
-                    coming from ensembling. None if `ensemble_size = 1`
-        """
-        # Model-specific optimal default values leading to fast and reasonable results.
+        """Predict metric depth from RGB, sparse SfM depth, and a normal prior."""
         if denoising_steps is None:
             denoising_steps = self.default_denoising_steps
         if processing_res is None:
@@ -194,22 +257,19 @@ class MurrePipeline(DiffusionPipeline):
         assert processing_res >= 0
         assert ensemble_size >= 1
 
-        # Check if denoising step is reasonable
         self._check_inference_step(denoising_steps)
-
         resample_method: InterpolationMode = get_tv_resample_method(resample_method)
 
         # ----------------- Image Preprocess -----------------
-        # Convert to torch tensor
         if isinstance(input_image, Image.Image):
             input_image = input_image.convert("RGB")
-            # convert to torch tensor [H, W, rgb] -> [rgb, H, W]
             rgb = pil_to_tensor(input_image)
-            rgb = rgb.unsqueeze(0)  # [1, rgb, H, W]
+            rgb = rgb.unsqueeze(0)
         elif isinstance(input_image, torch.Tensor):
             rgb = input_image
         else:
             raise TypeError(f"Unknown input type: {type(input_image) = }")
+
         input_size = rgb.shape
         assert (
             4 == rgb.dim() and 3 == input_size[-3]
@@ -217,35 +277,44 @@ class MurrePipeline(DiffusionPipeline):
 
         sdpt = input_sparse_depth
 
-        # Resize image
         rgb = resize_max_res(
             rgb,
             max_edge_resolution=processing_res,
             resample_method=resample_method,
         )
 
-        # Normalize rgb values
-        rgb_norm: torch.Tensor = rgb / 255.0 * 2.0 - 1.0  #  [0, 255] -> [-1, 1]
+        rgb_norm: torch.Tensor = rgb / 255.0 * 2.0 - 1.0
         rgb_norm = rgb_norm.to(self.dtype)
         assert rgb_norm.min() >= -1.0 and rgb_norm.max() <= 1.0
+
+        # ----------------- Normal Preprocess -----------------
+        normal = self._prepare_normal(
+            input_normal,
+            target_size=rgb.shape[2:],
+            dtype=self.dtype,
+        )
 
         # ----------------- Sparse Depth Preprocess -----------------
         logging.info(f"sdpt.shape {sdpt.shape} & rgb.shape[2:] {rgb.shape[2:]}")
         assert sdpt.shape == rgb.shape[2:]
-        # Normalize depth
         sdpt_norm, d_min, d_max = normalize_depth(sdpt, pre_clip_max=max_depth)
 
-        # Interpolate depth
         idpt, dist = interp_depth(sdpt_norm)
         idpt, dist = torch.from_numpy(idpt), torch.from_numpy(dist)
         idpt = idpt * 2.0 - 1.0
 
         # ----------------- Predicting depth -----------------
-        # Batch repeated input image
         duplicated_rgb = rgb_norm.expand(ensemble_size, -1, -1, -1)
         duplicated_idpt = idpt.unsqueeze(0).unsqueeze(0).expand(ensemble_size, 3, -1, -1)
         duplicated_dist = dist.unsqueeze(0).unsqueeze(0).expand(ensemble_size, -1, -1, -1)
-        single_rgb_dataset = TensorDataset(duplicated_rgb, duplicated_idpt, duplicated_dist)
+        duplicated_normal = normal.expand(ensemble_size, -1, -1, -1)
+        single_rgb_dataset = TensorDataset(
+            duplicated_rgb,
+            duplicated_idpt,
+            duplicated_dist,
+            duplicated_normal,
+        )
+
         if batch_size > 0:
             _bs = batch_size
         else:
@@ -259,7 +328,6 @@ class MurrePipeline(DiffusionPipeline):
             single_rgb_dataset, batch_size=_bs, shuffle=False
         )
 
-        # Predict depth maps (batched)
         depth_pred_ls = []
         if show_progress_bar:
             iterable = tqdm(
@@ -267,22 +335,24 @@ class MurrePipeline(DiffusionPipeline):
             )
         else:
             iterable = single_rgb_loader
+
         for batch in iterable:
-            (batched_img, batched_idpt, batched_dist) = batch
-            depth_pred_raw = self.single_infer( 
+            (batched_img, batched_idpt, batched_dist, batched_normal) = batch
+            depth_pred_raw = self.single_infer(
                 rgb_in=batched_img,
                 idpt_in=batched_idpt,
                 dist_in=batched_dist,
+                normal_in=batched_normal,
                 num_inference_steps=denoising_steps,
                 show_pbar=show_progress_bar,
                 generator=generator,
-                model_dtype=model_dtype
+                model_dtype=model_dtype,
             )
             depth_pred_ls.append(depth_pred_raw.detach())
-        depth_preds = torch.concat(depth_pred_ls, dim=0)
-        torch.cuda.empty_cache()  # clear vram cache for ensembling
 
-        # ----------------- Test-time ensembling -----------------
+        depth_preds = torch.concat(depth_pred_ls, dim=0)
+        torch.cuda.empty_cache()
+
         if ensemble_size > 1:
             depth_pred = depth_preds.median(dim=0, keepdim=True)[0]
             pred_uncert = None
@@ -290,25 +360,18 @@ class MurrePipeline(DiffusionPipeline):
             depth_pred = depth_preds
             pred_uncert = None
 
-        # Clip output range
         depth_pred = depth_pred.squeeze().clip(0, 1)
-
-        # Convert to numpy
         depth_pred = depth_pred.cpu().numpy()
         if pred_uncert is not None:
             pred_uncert = pred_uncert.squeeze().cpu().numpy()
 
-        # Re-norm back to metric depth
         depth_pred_metric = renorm_depth(depth_pred, d_min, d_max)
-            
-        # Align with sparse depth
         depth_pred_metric = align_depth(depth_pred_metric, sdpt)
 
-        # Colorize
         if color_map is not None:
             depth_colored = colorize_depth_maps(
                 depth_pred, depth_pred.min(), depth_pred.max(), cmap=color_map
-            ).squeeze()  # [3, H, W], value in (0, 1)
+            ).squeeze()
             depth_colored = (depth_colored * 255).astype(np.uint8)
             depth_colored_hwc = chw2hwc(depth_colored)
             depth_colored_img = Image.fromarray(depth_colored_hwc)
@@ -316,17 +379,13 @@ class MurrePipeline(DiffusionPipeline):
             depth_colored_img = None
 
         return MurreDepthOutput(
-            depth_np=depth_pred_metric.clip(0., max_depth),
+            depth_np=depth_pred_metric.clip(0.0, max_depth),
             depth_colored=depth_colored_img,
             uncertainty=pred_uncert,
         )
 
     def _check_inference_step(self, n_step: int) -> None:
-        """
-        Check if denoising step is reasonable
-        Args:
-            n_step (`int`): denoising steps
-        """
+        """Check if the requested number of denoising steps is reasonable."""
         assert n_step >= 1
 
         if isinstance(self.scheduler, DDIMScheduler):
@@ -343,9 +402,7 @@ class MurrePipeline(DiffusionPipeline):
             raise RuntimeError(f"Unsupported scheduler type: {type(self.scheduler)}")
 
     def encode_empty_text(self):
-        """
-        Encode text embedding for empty prompt
-        """
+        """Encode text embedding for an empty prompt."""
         prompt = ""
         text_inputs = self.tokenizer(
             prompt,
@@ -363,60 +420,56 @@ class MurrePipeline(DiffusionPipeline):
         rgb_in: torch.Tensor,
         idpt_in: torch.Tensor,
         dist_in: torch.Tensor,
+        normal_in: torch.Tensor,
         num_inference_steps: int,
         generator: Union[torch.Generator, None],
         show_pbar: bool,
-        model_dtype=torch.float32
+        model_dtype=torch.float32,
     ) -> torch.Tensor:
-        """
-        Perform an individual depth prediction without ensembling.
-
-        Args:
-            rgb_in (`torch.Tensor`):
-                Input RGB image.
-            num_inference_steps (`int`):
-                Number of diffusion denoisign steps (DDIM) during inference.
-            show_pbar (`bool`):
-                Display a progress bar of diffusion denoising.
-            generator (`torch.Generator`)
-                Random generator for initial noise generation.
-        Returns:
-            `torch.Tensor`: Predicted depth map.
-        """
+        """Perform an individual depth prediction without ensembling."""
         device = self.device
         rgb_in = rgb_in.to(device).to(model_dtype)
         idpt_in = idpt_in.to(device).to(model_dtype)
         dist_in = dist_in.to(device).to(model_dtype)
+        normal_in = normal_in.to(device).to(model_dtype)
 
-        # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps  # [T]
+        timesteps = self.scheduler.timesteps
 
-        # Encode image
         rgb_latent = self.encode_rgb(rgb_in)
-
-        # Encode interpolated depth
         ipdt_latent = self.encode_rgb(idpt_in)
-        
-        # Downsample distance map
-        dist_down = F.interpolate(dist_in, size=(rgb_latent.shape[2], rgb_latent.shape[3]), mode='nearest')
 
-        # Initial depth map (noise)
+        dist_down = F.interpolate(
+            dist_in,
+            size=(rgb_latent.shape[2], rgb_latent.shape[3]),
+            mode="nearest",
+        )
+        normal_down = F.interpolate(
+            normal_in,
+            size=(rgb_latent.shape[2], rgb_latent.shape[3]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        normal_norm = torch.linalg.vector_norm(normal_down, dim=1, keepdim=True)
+        normal_down = torch.where(
+            normal_norm > 1e-6,
+            normal_down / normal_norm.clamp_min(1e-6),
+            torch.zeros_like(normal_down),
+        )
+
         depth_latent = torch.randn(
             rgb_latent.shape,
             device=device,
             dtype=self.dtype,
             generator=generator,
-        )  # [B, 4, h, w]
+        )
 
-        # Batched empty text embedding
         if self.empty_text_embed is None:
             self.encode_empty_text()
         batch_empty_text_embed = self.empty_text_embed.repeat(
             (rgb_latent.shape[0], 1, 1)
-        ).to(device)  # [B, 2, 1024]
+        ).to(device)
 
-        # Denoising loop
         if show_pbar:
             iterable = tqdm(
                 enumerate(timesteps),
@@ -428,64 +481,38 @@ class MurrePipeline(DiffusionPipeline):
             iterable = enumerate(timesteps)
 
         for i, t in iterable:
+            # Keep the original 13 Murre channels in exactly the same positions and
+            # append the 3 normal channels at the end for checkpoint compatibility.
             unet_input = torch.cat(
-                [rgb_latent, ipdt_latent, dist_down, depth_latent], dim=1
-            )  # this order is important NOTE: check
+                [rgb_latent, ipdt_latent, dist_down, depth_latent, normal_down],
+                dim=1,
+            )
 
-            # predict the noise residual NOTE: check
             noise_pred = self.unet(
                 unet_input, t, encoder_hidden_states=batch_empty_text_embed
-            ).sample  # [B, 4, h, w]
+            ).sample
 
-            # compute the previous noisy sample x_t -> x_t-1
             depth_latent = self.scheduler.step(
                 noise_pred, t, depth_latent, generator=generator
             ).prev_sample
 
         depth = self.decode_depth(depth_latent)
-
-        # clip prediction
         depth = torch.clip(depth, -1.0, 1.0)
-        # shift to [0, 1]
         depth = (depth + 1.0) / 2.0
-
         return depth
 
     def encode_rgb(self, rgb_in: torch.Tensor) -> torch.Tensor:
-        """
-        Encode RGB image into latent.
-
-        Args:
-            rgb_in (`torch.Tensor`):
-                Input RGB image to be encoded.
-
-        Returns:
-            `torch.Tensor`: Image latent.
-        """
-        # encode
+        """Encode a three-channel image into the VAE latent space."""
         h = self.vae.encoder(rgb_in)
         moments = self.vae.quant_conv(h)
         mean, logvar = torch.chunk(moments, 2, dim=1)
-        # scale latent
         rgb_latent = mean * self.rgb_latent_scale_factor
         return rgb_latent
 
     def decode_depth(self, depth_latent: torch.Tensor) -> torch.Tensor:
-        """
-        Decode depth latent into depth map.
-
-        Args:
-            depth_latent (`torch.Tensor`):
-                Depth latent to be decoded.
-
-        Returns:
-            `torch.Tensor`: Decoded depth map.
-        """
-        # scale latent
+        """Decode a depth latent into a one-channel depth map."""
         depth_latent = depth_latent / self.depth_latent_scale_factor
-        # decode
         z = self.vae.post_quant_conv(depth_latent)
         stacked = self.vae.decoder(z)
-        # mean of output channels
         depth_mean = stacked.mean(dim=1, keepdim=True)
         return depth_mean
