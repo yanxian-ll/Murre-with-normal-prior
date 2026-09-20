@@ -157,6 +157,83 @@ def _random_crop_pair(
     return rgb, depth
 
 
+def _sample_border_endpoints(
+    min_ratio: float,
+    max_ratio: float,
+    slant_probability: float,
+    slant_max_delta: float,
+):
+    """Sample the two inward offsets of one border occluder.
+
+    Equal offsets give the old axis-aligned mask. Different offsets produce an
+    oblique cutting line. `slant_max_delta` is the maximum difference between
+    the two endpoint offsets, expressed as a fraction of image size.
+    """
+    center = random.uniform(min_ratio, max_ratio)
+    if random.random() >= slant_probability or slant_max_delta <= 0:
+        return center, center
+
+    delta = random.uniform(-slant_max_delta, slant_max_delta)
+    r0 = float(np.clip(center - 0.5 * delta, 0.0, 0.49))
+    r1 = float(np.clip(center + 0.5 * delta, 0.0, 0.49))
+    return r0, r1
+
+
+def _draw_border_occluder(
+    mask: np.ndarray,
+    side: str,
+    r0: float,
+    r1: float,
+):
+    """Union one straight/slanted border polygon into a binary mask."""
+    h, w = mask.shape
+    x1 = max(w - 1, 0)
+    y1 = max(h - 1, 0)
+
+    if side == "top":
+        y_left = int(round(r0 * h))
+        y_right = int(round(r1 * h))
+        points = np.array(
+            [[0, 0], [x1, 0], [x1, min(y_right, y1)], [0, min(y_left, y1)]],
+            dtype=np.int32,
+        )
+    elif side == "bottom":
+        y_left = int(round(r0 * h))
+        y_right = int(round(r1 * h))
+        points = np.array(
+            [
+                [0, y1],
+                [x1, y1],
+                [x1, max(y1 - y_right, 0)],
+                [0, max(y1 - y_left, 0)],
+            ],
+            dtype=np.int32,
+        )
+    elif side == "left":
+        x_top = int(round(r0 * w))
+        x_bottom = int(round(r1 * w))
+        points = np.array(
+            [[0, 0], [min(x_top, x1), 0], [min(x_bottom, x1), y1], [0, y1]],
+            dtype=np.int32,
+        )
+    elif side == "right":
+        x_top = int(round(r0 * w))
+        x_bottom = int(round(r1 * w))
+        points = np.array(
+            [
+                [x1, 0],
+                [x1, y1],
+                [max(x1 - x_bottom, 0), y1],
+                [max(x1 - x_top, 0), 0],
+            ],
+            dtype=np.int32,
+        )
+    else:
+        raise ValueError(f"Unknown border side: {side}")
+
+    cv2.fillPoly(mask, [points], 1)
+
+
 def _apply_border_occlusion(
     depth: np.ndarray,
     min_ratio: float,
@@ -164,33 +241,58 @@ def _apply_border_occlusion(
     min_sides: int,
     max_sides: int,
     probability: float,
+    slant_probability: float = 0.8,
+    slant_max_delta: float = 0.25,
+    min_visible_ratio: float = 0.15,
+    max_attempts: int = 8,
 ) -> np.ndarray:
-    """Mask random portions of 1-4 image borders to simulate missing input depth."""
-    masked = depth.copy()
+    """Mask random border regions using straight or oblique polygon boundaries.
+
+    Each selected side contributes a polygon connected to that image border. The
+    inward boundary may be horizontal/vertical or slanted. Combining several sides
+    naturally creates trapezoids, triangular wedges, and irregular convex/non-convex
+    visible regions while keeping the missing region attached to the image boundary.
+    """
     if random.random() > probability:
-        return masked
+        return depth.copy()
 
-    h, w = masked.shape
+    valid_original = np.isfinite(depth) & (depth > 0)
+    original_count = int(valid_original.sum())
+    min_visible = max(3, int(round(original_count * min_visible_ratio)))
+
     sides = ["top", "bottom", "left", "right"]
-    n_sides = random.randint(min_sides, max_sides)
-    chosen = random.sample(sides, k=n_sides)
+    best = depth.copy()
+    best_visible = original_count
 
-    for side in chosen:
-        ratio = random.uniform(min_ratio, max_ratio)
-        if side == "top":
-            n = min(h, max(1, int(round(h * ratio))))
-            masked[:n, :] = 0.0
-        elif side == "bottom":
-            n = min(h, max(1, int(round(h * ratio))))
-            masked[h - n :, :] = 0.0
-        elif side == "left":
-            n = min(w, max(1, int(round(w * ratio))))
-            masked[:, :n] = 0.0
-        elif side == "right":
-            n = min(w, max(1, int(round(w * ratio))))
-            masked[:, w - n :] = 0.0
+    for _ in range(max_attempts):
+        occlusion_mask = np.zeros(depth.shape, dtype=np.uint8)
+        n_sides = random.randint(min_sides, max_sides)
+        chosen = random.sample(sides, k=n_sides)
 
-    return masked
+        for side in chosen:
+            r0, r1 = _sample_border_endpoints(
+                min_ratio=min_ratio,
+                max_ratio=max_ratio,
+                slant_probability=slant_probability,
+                slant_max_delta=slant_max_delta,
+            )
+            _draw_border_occluder(occlusion_mask, side, r0, r1)
+
+        candidate = depth.copy()
+        candidate[occlusion_mask.astype(bool)] = 0.0
+        visible_count = int((np.isfinite(candidate) & (candidate > 0)).sum())
+
+        if visible_count >= min_visible:
+            return candidate
+        if 0 < visible_count < best_visible:
+            best = candidate
+            best_visible = visible_count
+
+    # Extremely aggressive combinations are retried above. If all attempts violate
+    # the minimum-visible constraint, use the least destructive valid candidate.
+    if best_visible >= 3:
+        return best
+    return depth.copy()
 
 
 class MurreNormalTrainingDataset(Dataset):
@@ -215,8 +317,8 @@ class MurreNormalTrainingDataset(Dataset):
     contains more images.
 
     Full GT depth is used for the diffusion target and to generate the temporary
-    normal prior. A copy of GT depth is border-masked to simulate the incomplete
-    depth condition given to Murre.
+    normal prior. A copy of GT depth is border-masked with straight/slanted polygon
+    occluders to simulate an incomplete depth condition given to Murre.
     """
 
     def __init__(
@@ -236,6 +338,9 @@ class MurreNormalTrainingDataset(Dataset):
         occlusion_max_ratio: float = 0.25,
         occlusion_min_sides: int = 1,
         occlusion_max_sides: int = 4,
+        occlusion_slant_probability: float = 0.8,
+        occlusion_slant_max_delta: float = 0.25,
+        occlusion_min_visible_ratio: float = 0.15,
     ):
         super().__init__()
         if height % 8 != 0 or width % 8 != 0:
@@ -248,6 +353,12 @@ class MurreNormalTrainingDataset(Dataset):
             raise ValueError("occlusion ratios must satisfy 0 <= min <= max < 0.5")
         if not 1 <= occlusion_min_sides <= occlusion_max_sides <= 4:
             raise ValueError("occlusion side counts must satisfy 1 <= min <= max <= 4")
+        if not 0.0 <= occlusion_slant_probability <= 1.0:
+            raise ValueError("occlusion_slant_probability must be in [0, 1]")
+        if not 0.0 <= occlusion_slant_max_delta < 0.5:
+            raise ValueError("occlusion_slant_max_delta must be in [0, 0.5)")
+        if not 0.0 < occlusion_min_visible_ratio <= 1.0:
+            raise ValueError("occlusion_min_visible_ratio must be in (0, 1]")
 
         self.height = int(height)
         self.width = int(width)
@@ -263,6 +374,9 @@ class MurreNormalTrainingDataset(Dataset):
         self.occlusion_max_ratio = float(occlusion_max_ratio)
         self.occlusion_min_sides = int(occlusion_min_sides)
         self.occlusion_max_sides = int(occlusion_max_sides)
+        self.occlusion_slant_probability = float(occlusion_slant_probability)
+        self.occlusion_slant_max_delta = float(occlusion_slant_max_delta)
+        self.occlusion_min_visible_ratio = float(occlusion_min_visible_ratio)
 
         self.datasets: List[Dict] = []
         self.total_pairs = 0
@@ -359,7 +473,8 @@ class MurreNormalTrainingDataset(Dataset):
             return self.__getitem__(0)
 
         # Simulated incomplete depth condition: start from the complete GT depth,
-        # then remove random border regions. The full GT remains the target.
+        # then remove random straight/slanted border polygons. The full GT remains
+        # the diffusion target and normal-prior source.
         input_depth = _apply_border_occlusion(
             gt_depth,
             min_ratio=self.occlusion_min_ratio,
@@ -367,6 +482,9 @@ class MurreNormalTrainingDataset(Dataset):
             min_sides=self.occlusion_min_sides,
             max_sides=self.occlusion_max_sides,
             probability=self.occlusion_probability,
+            slant_probability=self.occlusion_slant_probability,
+            slant_max_delta=self.occlusion_slant_max_delta,
+            min_visible_ratio=self.occlusion_min_visible_ratio,
         )
         observed = np.isfinite(input_depth) & (input_depth > 0)
         if int(observed.sum()) < 3:
