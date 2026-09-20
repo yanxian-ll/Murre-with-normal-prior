@@ -97,9 +97,36 @@ def _read_intrinsics(path: str) -> np.ndarray:
     raise ValueError(f"No intrinsic block found in {path}")
 
 
+def _depth_valid_mask(depth: np.ndarray) -> np.ndarray:
+    """GT depth is valid only for finite, strictly-positive pixels."""
+    return np.isfinite(depth) & (depth > 0)
+
+
+def _normal_valid_from_depth_valid(valid: np.ndarray) -> np.ndarray:
+    """Require center/left/right/up/down GT depths for a trustworthy normal.
+
+    ``depth_to_camera_normal`` uses central differences from the four direct
+    neighbours. A depth hole therefore invalidates not only that pixel but also the
+    normals immediately adjacent to it. Image borders are conservatively invalidated.
+    """
+    valid_u8 = np.asarray(valid, dtype=np.uint8)
+    kernel = np.asarray(
+        [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+        dtype=np.uint8,
+    )
+    eroded = cv2.erode(
+        valid_u8,
+        kernel,
+        iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return eroded.astype(bool)
+
+
 def _resize_depth(depth: np.ndarray, width: int, height: int) -> np.ndarray:
     """Resize depth while preserving invalid (<=0) pixels."""
-    valid = np.isfinite(depth) & (depth > 0)
+    valid = _depth_valid_mask(depth)
     clean = np.where(valid, depth, 0).astype(np.float32)
     resized = cv2.resize(clean, (width, height), interpolation=cv2.INTER_LINEAR)
     coverage = cv2.resize(valid.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
@@ -268,7 +295,7 @@ def _apply_border_occlusion(
     if random.random() > probability:
         return depth.copy()
 
-    valid_original = np.isfinite(depth) & (depth > 0)
+    valid_original = _depth_valid_mask(depth)
     original_count = int(valid_original.sum())
     min_visible = max(3, int(round(original_count * min_visible_ratio)))
 
@@ -292,7 +319,7 @@ def _apply_border_occlusion(
 
         candidate = depth.copy()
         candidate[occlusion_mask.astype(bool)] = 0.0
-        visible_count = int((np.isfinite(candidate) & (candidate > 0)).sum())
+        visible_count = int(_depth_valid_mask(candidate).sum())
 
         if visible_count >= min_visible:
             return candidate
@@ -351,10 +378,14 @@ class MurreNormalTrainingDataset(Dataset):
 
     Full GT depth is used for the diffusion target. A copy of GT depth is
     border-masked with straight/slanted polygon occluders to simulate an incomplete
-    depth condition given to Murre. The surface-normal prior is predicted online by
-    Metric3D from RGB (``normal_source="metric3d"``), so training matches inference;
-    ``normal_source="gt_depth"`` derives the same camera-space prior from GT depth
-    and is intended for ablations only.
+    depth condition given to Murre. Samples whose raw or final augmented GT depth has
+    less than ``min_gt_valid_ratio`` valid coverage are skipped. Normal supervision
+    is additionally masked by a one-pixel cross erosion of the GT validity mask, so
+    invalid depth never contaminates finite-difference normals.
+
+    The surface-normal prior is predicted online by Metric3D from RGB
+    (``normal_source="metric3d"``), or derived from the final augmented GT depth and
+    final intrinsics for ``normal_source="gt_depth"``.
 
     Unreadable or degenerate frames (missing EXR codec, all-zero depth, RGB/depth
     shape mismatch, missing intrinsics, ...) are skipped by drawing another sample
@@ -396,6 +427,7 @@ class MurreNormalTrainingDataset(Dataset):
         metric3d_device: str = "cuda",
         max_retries: int = 8,
         min_valid_pixels: int = 256,
+        min_gt_valid_ratio: float = 0.9,
     ):
         super().__init__()
         if height % 8 != 0 or width % 8 != 0:
@@ -428,6 +460,8 @@ class MurreNormalTrainingDataset(Dataset):
             raise ValueError("max_retries must be >= 1")
         if min_valid_pixels < 1:
             raise ValueError("min_valid_pixels must be >= 1")
+        if not 0.0 < min_gt_valid_ratio <= 1.0:
+            raise ValueError("min_gt_valid_ratio must be in (0, 1]")
         if dataset_roots is None and index_path is None:
             raise ValueError("Provide either dataset_roots or index_path")
 
@@ -457,6 +491,7 @@ class MurreNormalTrainingDataset(Dataset):
         self.normal_source = normal_source
         self.max_retries = int(max_retries)
         self.min_valid_pixels = int(min_valid_pixels)
+        self.min_gt_valid_ratio = float(min_gt_valid_ratio)
         self.index_path = str(index_path) if index_path is not None else None
         self.metric3d_params = {
             "metric3d_checkpoint": metric3d_checkpoint,
@@ -616,7 +651,7 @@ class MurreNormalTrainingDataset(Dataset):
         """
         if self.max_depth_mode == "fixed":
             return self.max_depth
-        valid = depth[np.isfinite(depth) & (depth > 0)]
+        valid = depth[_depth_valid_mask(depth)]
         if valid.size == 0:
             return 0.0
         cap = float(np.percentile(valid, self.max_depth_quantile)) * self.max_depth_scale
@@ -636,10 +671,17 @@ class MurreNormalTrainingDataset(Dataset):
             raise ValueError(
                 f"RGB/depth resolution mismatch: RGB={rgb.shape[:2]} depth={depth.shape}"
             )
-        finite = np.isfinite(depth) & (depth > 0)
-        if int(finite.sum()) < self.min_valid_pixels:
+        finite = _depth_valid_mask(depth)
+        valid_count = int(finite.sum())
+        if valid_count < self.min_valid_pixels:
             raise ValueError(
-                f"Unusable depth: only {int(finite.sum())} valid pixels in {depth_path}"
+                f"Unusable depth: only {valid_count} valid pixels in {depth_path}"
+            )
+        raw_valid_ratio = float(finite.mean())
+        if raw_valid_ratio < self.min_gt_valid_ratio:
+            raise ValueError(
+                f"GT depth valid ratio too low before augmentation: {raw_valid_ratio:.4f} "
+                f"< {self.min_gt_valid_ratio:.4f} in {depth_path}"
             )
 
         intrinsics = self._intrinsics_for(camera_path)
@@ -655,8 +697,6 @@ class MurreNormalTrainingDataset(Dataset):
                 intrinsics, work_w / float(width), work_h / float(height)
             )
 
-        normal = self._normal_prior(rgb, depth, intrinsics)
-
         top, left, crop_h, crop_w = _sample_crop_box(
             rgb=rgb,
             depth=depth,
@@ -667,7 +707,6 @@ class MurreNormalTrainingDataset(Dataset):
         )
         rgb = rgb[top : top + crop_h, left : left + crop_w]
         depth = depth[top : top + crop_h, left : left + crop_w]
-        normal = normal[top : top + crop_h, left : left + crop_w]
 
         intrinsics = np.array(intrinsics, dtype=np.float32, copy=True)
         intrinsics[0, 2] -= float(left)
@@ -678,27 +717,48 @@ class MurreNormalTrainingDataset(Dataset):
 
         rgb = cv2.resize(rgb, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
         depth = _resize_depth(depth, self.width, self.height)
-        normal = cv2.resize(
-            normal, (self.width, self.height), interpolation=cv2.INTER_LINEAR
-        )
 
         if self.random_flip and random.random() < 0.5:
             rgb = np.ascontiguousarray(rgb[:, ::-1])
             depth = np.ascontiguousarray(depth[:, ::-1])
-            normal = np.ascontiguousarray(normal[:, ::-1])
-            # A mirrored image is described by a mirrored camera: the principal point
-            # flips and the camera x axis reverses, so the prior flips in x too.
+            # The principal point follows the horizontal image flip. GT normals are
+            # computed only after this transformation, from the final depth + K.
             intrinsics[0, 2] = (self.width - 1.0) - intrinsics[0, 2]
-            normal = normal.copy()
-            normal[..., 0] *= -1.0
 
-        gt_valid = np.isfinite(depth) & (depth > 0)
-        if int(gt_valid.sum()) < 16:
-            raise ValueError("Too few valid depth pixels after crop/resize")
+        gt_valid = _depth_valid_mask(depth)
+        final_valid_count = int(gt_valid.sum())
+        if final_valid_count < self.min_valid_pixels:
+            raise ValueError(
+                f"Too few valid GT-depth pixels after crop/resize: {final_valid_count}"
+            )
+        final_valid_ratio = float(gt_valid.mean())
+        if final_valid_ratio < self.min_gt_valid_ratio:
+            raise ValueError(
+                f"GT depth valid ratio too low after augmentation: {final_valid_ratio:.4f} "
+                f"< {self.min_gt_valid_ratio:.4f}"
+            )
 
-        # Simulated incomplete depth condition: start from the complete GT depth,
-        # then remove random straight/slanted border polygons. The full GT remains
-        # the diffusion target.
+        # Compute/predict the normal only on the final augmented grid. In particular,
+        # gt_depth normals are no longer resized from a pre-crop normal map.
+        normal = self._normal_prior(rgb, depth, intrinsics)
+        gt_normal_valid = _normal_valid_from_depth_valid(gt_valid)
+        normal_mag = np.linalg.norm(normal, axis=-1)
+        if self.normal_source == "gt_depth":
+            normal_valid = gt_normal_valid & np.isfinite(normal).all(axis=-1) & (normal_mag > 1e-6)
+            # Never expose a fake normal generated from zero/invalid GT depth.
+            normal = np.asarray(normal, dtype=np.float32).copy()
+            normal[~normal_valid] = 0.0
+        elif self.normal_source == "deferred_metric3d":
+            # train.py predicts Metric3D after batching. This mask still gates the
+            # normal loss by trustworthy GT geometry.
+            normal_valid = gt_normal_valid
+        else:
+            # Metric3D may predict everywhere, but loss is only applied where the GT
+            # depth neighbourhood is valid; the prior itself remains available as input.
+            normal_valid = gt_normal_valid & np.isfinite(normal).all(axis=-1) & (normal_mag > 1e-6)
+
+        # Simulated incomplete depth condition: start from the valid GT depth, then
+        # remove random straight/slanted border polygons. Original GT holes stay holes.
         input_depth = _apply_border_occlusion(
             depth,
             min_ratio=self.occlusion_min_ratio,
@@ -710,7 +770,7 @@ class MurreNormalTrainingDataset(Dataset):
             slant_max_delta=self.occlusion_slant_max_delta,
             min_visible_ratio=self.occlusion_min_visible_ratio,
         )
-        observed = np.isfinite(input_depth) & (input_depth > 0)
+        observed = _depth_valid_mask(input_depth)
         if int(observed.sum()) < 3:
             raise ValueError("Border occlusion removed every valid depth pixel")
 
@@ -722,9 +782,9 @@ class MurreNormalTrainingDataset(Dataset):
 
         depth_range = max(float(d_max - d_min), 1e-6)
         gt_01 = np.clip((depth - float(d_min)) / depth_range, 0.0, 1.0)
-
-        normal_mag = np.linalg.norm(normal, axis=-1)
-        normal_valid = normal_mag > 1e-6
+        # Invalid GT pixels are ignored by gt_valid/valid_latent_mask. Keep their
+        # stored target finite so the frozen VAE never sees NaN/Inf.
+        gt_01[~gt_valid] = 0.0
 
         rgb_norm = rgb.astype(np.float32) / 127.5 - 1.0
         gt_norm = gt_01.astype(np.float32) * 2.0 - 1.0
@@ -745,21 +805,21 @@ class MurreNormalTrainingDataset(Dataset):
             ).permute(2, 0, 1),
             "normal_valid": torch.from_numpy(normal_valid).unsqueeze(0).bool(),
             "intrinsics": torch.from_numpy(np.ascontiguousarray(intrinsics, dtype=np.float32)),
-            # The normal loss uses this only as an observed/missing indicator:
-            # masked borders are fully supervised; observed interior keeps the
-            # lowest-loss fraction by default.
+            # The normal loss uses this only as an observed/missing indicator. The
+            # final mask is additionally intersected with normal_valid in train.py.
             "sparse_observed": torch.from_numpy(observed.astype(np.float32))
             .unsqueeze(0)
             .contiguous(),
             "d_min": torch.tensor(float(d_min), dtype=torch.float32),
             "d_max": torch.tensor(float(d_max), dtype=torch.float32),
             "depth_scale": torch.tensor(float(scale), dtype=torch.float32),
+            "gt_valid_ratio": torch.tensor(final_valid_ratio, dtype=torch.float32),
         }
 
     def _normal_prior(
         self, rgb: np.ndarray, depth: np.ndarray, intrinsics: np.ndarray
     ) -> np.ndarray:
-        """Camera-space normal prior for one working-resolution frame."""
+        """Camera-space normal prior for the final augmented training frame."""
         if self.normal_source == "deferred_metric3d":
             return np.zeros((*depth.shape, 3), dtype=np.float32)
         if self.normal_source == "metric3d":
@@ -772,7 +832,8 @@ class MurreNormalTrainingDataset(Dataset):
                 )
             return normal
 
-        # Ablation only: the same camera-space prior, but from leaked GT depth.
+        # GT-depth mode: derive the prior after every resize/crop/flip so depth, K and
+        # normal are geometrically consistent on the exact grid seen by the U-Net.
         depth_tensor = torch.from_numpy(np.ascontiguousarray(depth, dtype=np.float32))
         intrinsics_tensor = torch.from_numpy(np.ascontiguousarray(intrinsics, dtype=np.float32))
         with torch.no_grad():
