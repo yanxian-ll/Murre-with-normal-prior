@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fine-tune local Murre with frozen, online Metric3D RGB -> normal predictions.
+# Fine-tune local Murre with a normal prior. GT-depth normals are the default;
+# set NORMAL_SOURCE=metric3d to recover online Metric3D RGB -> normal priors.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.tools/murre-env/bin/python}"
@@ -17,8 +18,10 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+NORMAL_SOURCE="${NORMAL_SOURCE:-gt_depth}"
 NORMAL_WEIGHT="${NORMAL_WEIGHT:-0.1}"
 NORMAL_KEEP_RATIO="${NORMAL_KEEP_RATIO:-0.9}"
+MIN_GT_VALID_RATIO="${MIN_GT_VALID_RATIO:-0.9}"
 METRIC3D_DEVICE="${METRIC3D_DEVICE:-cuda}"
 METRIC3D_MAX_EDGE="${METRIC3D_MAX_EDGE:-1064}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
@@ -47,17 +50,25 @@ if [[ ! -s "$INDEX_PATH" || "${REBUILD_INDEX:-0}" == 1 ]]; then
 fi
 cmd=("$PYTHON_BIN" "$ROOT/Murre-with-normal-prior/train.py"
   --index "$INDEX_PATH" --checkpoint "$CHECKPOINT" --output_dir "$OUTPUT_DIR"
-  --normal_source metric3d --metric3d_checkpoint "$METRIC3D_CHECKPOINT"
-  --metric3d_device "$METRIC3D_DEVICE" --metric3d_max_edge "$METRIC3D_MAX_EDGE"
+  --normal_source "$NORMAL_SOURCE"
   --work_resolution "$WORK_RESOLUTION" --crop_scale_min "$CROP_SCALE_MIN" --crop_scale_max "$CROP_SCALE_MAX"
   --resolutions "${sizes[@]}" --batch_size "$BATCH_SIZE" --gradient_accumulation_steps "$GRAD_ACCUM"
   --max_steps "$MAX_STEPS" --learning_rate "$LEARNING_RATE" --num_workers "$NUM_WORKERS"
-  --max_retries "$MAX_RETRIES" --max_depth_mode auto --max_depth "$MAX_DEPTH"
+  --max_retries "$MAX_RETRIES" --min_gt_valid_ratio "$MIN_GT_VALID_RATIO"
+  --max_depth_mode auto --max_depth "$MAX_DEPTH"
   --normal_weight "$NORMAL_WEIGHT" --normal_keep_ratio "$NORMAL_KEEP_RATIO"
   --precision "$PRECISION" --gradient_checkpointing --random_flip --save_every "$SAVE_EVERY"
   --log_every "$LOG_EVERY" --tensorboard_dir "$TENSORBOARD_DIR"
   --val_every "$VAL_EVERY" --val_samples "$VAL_SAMPLES" --val_resolution "$VAL_RESOLUTION"
   --val_denoising_steps "$VAL_DENOISING_STEPS")
+if [[ "$NORMAL_SOURCE" == "metric3d" ]]; then
+  cmd+=(--metric3d_checkpoint "$METRIC3D_CHECKPOINT"
+        --metric3d_device "$METRIC3D_DEVICE"
+        --metric3d_max_edge "$METRIC3D_MAX_EDGE")
+elif [[ "$NORMAL_SOURCE" != "gt_depth" ]]; then
+  printf '不支持的 NORMAL_SOURCE=%s（仅支持 gt_depth / metric3d）\n' "$NORMAL_SOURCE" >&2
+  exit 2
+fi
 if [[ -n "${VAL_INDEX:-}" ]]; then cmd+=(--val_index "$VAL_INDEX"); fi
 if [[ -z "${RESUME:-}" && "$AUTO_RESUME" == 1 ]]; then
   RESUME="$("$PYTHON_BIN" - "$OUTPUT_DIR" "$ROOT" <<'PYRESUME'
