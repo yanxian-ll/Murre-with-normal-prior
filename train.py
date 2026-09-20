@@ -161,16 +161,40 @@ def build_parser():
         "--occlusion_min_ratio",
         type=float,
         default=0.05,
-        help="Minimum fraction masked from a selected image border.",
+        help="Minimum mean inward extent of a selected border mask.",
     )
     parser.add_argument(
         "--occlusion_max_ratio",
         type=float,
         default=0.25,
-        help="Maximum fraction masked from a selected image border.",
+        help="Maximum mean inward extent of a selected border mask.",
     )
     parser.add_argument("--occlusion_min_sides", type=int, default=1)
     parser.add_argument("--occlusion_max_sides", type=int, default=4)
+    parser.add_argument(
+        "--occlusion_slant_probability",
+        type=float,
+        default=0.8,
+        help=(
+            "Probability that each selected border uses an oblique cutting line. "
+            "The remaining cases use the old straight horizontal/vertical boundary."
+        ),
+    )
+    parser.add_argument(
+        "--occlusion_slant_max_delta",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum difference between the two endpoints of an oblique border line, "
+            "as a fraction of image width/height. Larger values give stronger wedges."
+        ),
+    )
+    parser.add_argument(
+        "--occlusion_min_visible_ratio",
+        type=float,
+        default=0.15,
+        help="Minimum fraction of originally valid depth kept after masking.",
+    )
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -274,6 +298,9 @@ def main():
         occlusion_max_ratio=args.occlusion_max_ratio,
         occlusion_min_sides=args.occlusion_min_sides,
         occlusion_max_sides=args.occlusion_max_sides,
+        occlusion_slant_probability=args.occlusion_slant_probability,
+        occlusion_slant_max_delta=args.occlusion_slant_max_delta,
+        occlusion_min_visible_ratio=args.occlusion_min_visible_ratio,
     )
     loader_generator = torch.Generator().manual_seed(args.seed)
     dataloader = DataLoader(
@@ -298,6 +325,16 @@ def main():
         "Sampling policy: uniform dataset -> uniform scene -> uniform image; crop_scale=[%.2f, %.2f]",
         args.crop_scale_min,
         args.crop_scale_max,
+    )
+    logging.info(
+        "Occlusion: sides=%d-%d ratio=[%.2f, %.2f] slant_prob=%.2f slant_delta<=%.2f min_visible=%.2f",
+        args.occlusion_min_sides,
+        args.occlusion_max_sides,
+        args.occlusion_min_ratio,
+        args.occlusion_max_ratio,
+        args.occlusion_slant_probability,
+        args.occlusion_slant_max_delta,
+        args.occlusion_min_visible_ratio,
     )
 
     # Marigold uses DDPM for the training forward diffusion process.
