@@ -1,6 +1,11 @@
 import os
+
+# OpenCV disables EXR in some builds unless this flag is set before importing cv2.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
+import random
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Sequence
 
 import cv2
 import numpy as np
@@ -12,261 +17,393 @@ from .util.depth_util import interp_depth, normalize_depth
 
 
 RGB_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-DEPTH_EXTENSIONS = {".npy", ".npz", ".png", ".tif", ".tiff", ".exr"}
-NORMAL_EXTENSIONS = DEPTH_EXTENSIONS | {".jpg", ".jpeg", ".bmp"}
-SPARSE_EXTENSIONS = {".npz", ".npy"}
+DEPTH_EXTENSIONS = {".exr", ".npy", ".npz", ".png", ".tif", ".tiff"}
 
 
-def _stem_map(root: str, extensions) -> Dict[str, str]:
-    root_path = Path(root)
-    if not root_path.exists():
-        raise FileNotFoundError(root)
-    mapping = {}
-    for path in root_path.rglob("*"):
+def _file_map(root: Path, extensions) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    if not root.is_dir():
+        return mapping
+    for path in root.iterdir():
         if path.is_file() and path.suffix.lower() in extensions:
-            # Training folders are expected to contain unique filename stems.
-            # This also works for a flat folder, which is the recommended layout.
-            if path.stem in mapping:
-                raise ValueError(
-                    f"Duplicate filename stem '{path.stem}' in {root}. "
-                    "Use unique stems for training samples."
-                )
             mapping[path.stem] = str(path)
     return mapping
 
 
-def _load_array(path: str) -> np.ndarray:
+def _load_depth(path: str, scale: float = 1.0) -> np.ndarray:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
-        return np.asarray(np.load(path))
-    if ext == ".npz":
+        depth = np.asarray(np.load(path))
+    elif ext == ".npz":
         pack = np.load(path, allow_pickle=True)
         if "depth" in pack:
-            return np.asarray(pack["depth"])
-        if "arr_0" in pack:
-            return np.asarray(pack["arr_0"])
-        return np.asarray(pack[pack.files[0]])
-    arr = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if arr is None:
-        raise ValueError(f"Failed to read array/image: {path}")
-    if arr.ndim == 3 and arr.shape[2] == 4:
-        arr = arr[..., :3]
-    return np.asarray(arr)
+            depth = np.asarray(pack["depth"])
+        elif "arr_0" in pack:
+            depth = np.asarray(pack["arr_0"])
+        else:
+            depth = np.asarray(pack[pack.files[0]])
+    else:
+        depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            raise ValueError(
+                f"Failed to read depth '{path}'. For EXR, make sure your OpenCV build has OpenEXR support."
+            )
 
-
-def _load_depth(path: str, scale: float) -> np.ndarray:
-    depth = _load_array(path).astype(np.float32)
+    depth = np.asarray(depth, dtype=np.float32)
     if depth.ndim == 3:
         if depth.shape[-1] == 1:
             depth = depth[..., 0]
         elif depth.shape[0] == 1:
             depth = depth[0]
         else:
+            # Some EXR writers save depth in one channel of a multi-channel image.
             depth = depth[..., 0]
     if depth.ndim != 2:
         raise ValueError(f"Depth must be HxW, got {depth.shape} from {path}")
+
     depth = depth * float(scale)
     depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
     return depth
 
 
-def _load_normal(path: str) -> np.ndarray:
-    ext = os.path.splitext(path)[1].lower()
-    # Preserve RGB channel order for encoded normal images. Depth arrays keep
-    # using OpenCV because 16-bit/float depth formats need unchanged loading.
-    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
-        normal = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
-    else:
-        normal = _load_array(path).astype(np.float32)
+def _resize_depth(depth: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize depth while preserving invalid (<=0) pixels."""
+    valid = np.isfinite(depth) & (depth > 0)
+    resized = cv2.resize(depth, (width, height), interpolation=cv2.INTER_LINEAR)
+    valid_resized = cv2.resize(
+        valid.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+    resized[~valid_resized] = 0.0
+    return resized.astype(np.float32)
 
-    if normal.ndim != 3:
-        raise ValueError(f"Normal must be HxWx3 or 3xHxW, got {normal.shape} from {path}")
-    if normal.shape[0] == 3 and normal.shape[-1] != 3:
-        normal = np.transpose(normal, (1, 2, 0))
-    if normal.shape[-1] != 3:
-        raise ValueError(f"Normal must have 3 channels, got {normal.shape} from {path}")
 
-    normal = np.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
-    n_min = float(normal.min())
-    n_max = float(normal.max())
-    if n_max > 2.0 or n_min < -1.5:
-        normal = normal / 127.5 - 1.0
-    elif n_min >= 0.0 and n_max <= 1.0:
-        normal = normal * 2.0 - 1.0
+def _depth_to_normal(depth_01: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Simple image-space normal from neighboring normalized depth values.
 
+    This intentionally matches `murre.util.normal_util.depth_to_normal`:
+        n = normalize([-dD/dx, -dD/dy, 1]).
+
+    The prior is generated from full GT depth for now. Later this function can be
+    replaced by an external normal estimator without changing the trainer interface.
+    """
+    depth_01 = np.asarray(depth_01, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+
+    padded = np.pad(depth_01, ((1, 1), (1, 1)), mode="edge")
+    dzdx = 0.5 * (padded[1:-1, 2:] - padded[1:-1, :-2])
+    dzdy = 0.5 * (padded[2:, 1:-1] - padded[:-2, 1:-1])
+
+    normal = np.stack([-dzdx, -dzdy, np.ones_like(depth_01)], axis=-1)
     magnitude = np.linalg.norm(normal, axis=-1, keepdims=True)
-    valid = magnitude > 1e-6
-    normal = np.where(valid, normal / np.maximum(magnitude, 1e-6), 0.0)
+    normal = normal / np.maximum(magnitude, 1e-6)
+
+    # A normal is supervised only where the center and four finite-difference
+    # neighbours belong to valid GT depth.
+    vp = np.pad(valid.astype(np.uint8), ((1, 1), (1, 1)), mode="constant")
+    normal_valid = (
+        vp[1:-1, 1:-1]
+        & vp[1:-1, :-2]
+        & vp[1:-1, 2:]
+        & vp[:-2, 1:-1]
+        & vp[2:, 1:-1]
+    ).astype(bool)
+    normal[~normal_valid] = 0.0
     return normal.astype(np.float32)
 
 
-def _load_sparse_pack(path: str):
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".npz":
-        pack = np.load(path, allow_pickle=True)
-        if "arr_0" in pack:
-            arr = np.asarray(pack["arr_0"])
-        else:
-            arr = np.asarray(pack[pack.files[0]])
-    else:
-        arr = np.asarray(np.load(path))
+def _random_crop_pair(
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    target_height: int,
+    target_width: int,
+    crop_scale_min: float,
+    crop_scale_max: float,
+):
+    """Random crop at the target aspect ratio, followed by resize."""
+    h, w = depth.shape
+    if rgb.shape[:2] != (h, w):
+        raise ValueError(
+            f"RGB/depth resolution mismatch: RGB={rgb.shape[:2]} depth={(h, w)}"
+        )
 
-    arr = arr.astype(np.float32)
-    if arr.ndim == 2:
-        depth = arr
-        err = np.zeros_like(depth)
-        nviews = np.full_like(depth, np.inf)
-    elif arr.ndim == 3 and arr.shape[-1] >= 1:
-        depth = arr[..., 0]
-        err = arr[..., 1] if arr.shape[-1] > 1 else np.zeros_like(depth)
-        nviews = arr[..., 2] if arr.shape[-1] > 2 else np.full_like(depth, np.inf)
-    else:
-        raise ValueError(f"Unsupported sparse-depth shape {arr.shape} from {path}")
+    target_aspect = float(target_width) / float(target_height)
+    image_aspect = float(w) / float(h)
 
-    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-    err = np.nan_to_num(err, nan=np.inf, posinf=np.inf, neginf=np.inf)
-    nviews = np.nan_to_num(nviews, nan=0.0, posinf=np.inf, neginf=0.0)
-    return depth, err, nviews
+    if image_aspect >= target_aspect:
+        max_crop_h = h
+        max_crop_w = int(round(h * target_aspect))
+    else:
+        max_crop_w = w
+        max_crop_h = int(round(w / target_aspect))
+
+    max_crop_h = max(1, min(max_crop_h, h))
+    max_crop_w = max(1, min(max_crop_w, w))
+
+    scale = random.uniform(crop_scale_min, crop_scale_max)
+    crop_h = max(1, int(round(max_crop_h * scale)))
+    crop_w = max(1, int(round(max_crop_w * scale)))
+
+    # Keep exact target aspect as closely as possible after integer rounding.
+    crop_w = min(w, max(1, int(round(crop_h * target_aspect))))
+    crop_h = min(h, max(1, int(round(crop_w / target_aspect))))
+
+    top = random.randint(0, max(h - crop_h, 0))
+    left = random.randint(0, max(w - crop_w, 0))
+    rgb = rgb[top : top + crop_h, left : left + crop_w]
+    depth = depth[top : top + crop_h, left : left + crop_w]
+
+    rgb = cv2.resize(rgb, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+    depth = _resize_depth(depth, target_width, target_height)
+    return rgb, depth
+
+
+def _apply_border_occlusion(
+    depth: np.ndarray,
+    min_ratio: float,
+    max_ratio: float,
+    min_sides: int,
+    max_sides: int,
+    probability: float,
+) -> np.ndarray:
+    """Mask random portions of 1-4 image borders to simulate missing input depth."""
+    masked = depth.copy()
+    if random.random() > probability:
+        return masked
+
+    h, w = masked.shape
+    sides = ["top", "bottom", "left", "right"]
+    n_sides = random.randint(min_sides, max_sides)
+    chosen = random.sample(sides, k=n_sides)
+
+    for side in chosen:
+        ratio = random.uniform(min_ratio, max_ratio)
+        if side == "top":
+            n = min(h, max(1, int(round(h * ratio))))
+            masked[:n, :] = 0.0
+        elif side == "bottom":
+            n = min(h, max(1, int(round(h * ratio))))
+            masked[h - n :, :] = 0.0
+        elif side == "left":
+            n = min(w, max(1, int(round(w * ratio))))
+            masked[:, :n] = 0.0
+        elif side == "right":
+            n = min(w, max(1, int(round(w * ratio))))
+            masked[:, w - n :] = 0.0
+
+    return masked
 
 
 class MurreNormalTrainingDataset(Dataset):
-    """Folder-based dataset for Murre fine-tuning with a normal prior.
+    """Hierarchical random sampler for multi-dataset / multi-scene training.
 
-    Files are matched by filename stem across four folders:
-      RGB, dense GT depth, SfM sparse depth, and normal prior.
+    Expected layout for every dataset root:
 
-    The sparse depth is normalized and interpolated exactly in the same style as
-    Murre inference. The dense GT depth is normalized with the *same* per-image
-    SfM-derived range, so the target latent and inference decoding convention match.
+        DATASET_ROOT/
+          scene_000/
+            images/
+              000001.jpg
+            depth/
+              000001.exr
+          scene_001/
+            images/
+            depth/
+
+    Sampling is deliberately hierarchical and uniform:
+        dataset -> scene -> image
+
+    Therefore a very large dataset or scene does not dominate simply because it
+    contains more images.
+
+    Full GT depth is used for the diffusion target and to generate the temporary
+    normal prior. A copy of GT depth is border-masked to simulate the incomplete
+    depth condition given to Murre.
     """
 
     def __init__(
         self,
-        rgb_dir: str,
-        gt_depth_dir: str,
-        sparse_depth_dir: str,
-        normal_dir: str,
+        dataset_roots: Sequence[str],
         height: int,
         width: int,
+        images_subdir: str = "images",
+        depth_subdir: str = "depth",
         max_depth: float = 80.0,
-        gt_depth_scale: float = 1.0,
-        sparse_depth_scale: float = 1.0,
-        err_thr: Optional[float] = None,
-        nviews_thr: Optional[int] = None,
+        depth_scale: float = 1.0,
+        crop_scale_min: float = 0.6,
+        crop_scale_max: float = 1.0,
         random_flip: bool = False,
-        min_sparse_points: int = 3,
+        occlusion_probability: float = 1.0,
+        occlusion_min_ratio: float = 0.05,
+        occlusion_max_ratio: float = 0.25,
+        occlusion_min_sides: int = 1,
+        occlusion_max_sides: int = 4,
     ):
         super().__init__()
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError("height and width must both be divisible by 8")
-
-        rgb_map = _stem_map(rgb_dir, RGB_EXTENSIONS)
-        gt_map = _stem_map(gt_depth_dir, DEPTH_EXTENSIONS)
-        sparse_map = _stem_map(sparse_depth_dir, SPARSE_EXTENSIONS)
-        normal_map = _stem_map(normal_dir, NORMAL_EXTENSIONS)
-
-        common = sorted(set(rgb_map) & set(gt_map) & set(sparse_map) & set(normal_map))
-        if not common:
-            raise RuntimeError(
-                "No common filename stems across RGB / GT depth / sparse depth / normal folders"
-            )
-
-        self.samples: List[Dict[str, str]] = [
-            {
-                "stem": stem,
-                "rgb": rgb_map[stem],
-                "gt": gt_map[stem],
-                "sparse": sparse_map[stem],
-                "normal": normal_map[stem],
-            }
-            for stem in common
-        ]
+        if not 0.0 < crop_scale_min <= crop_scale_max <= 1.0:
+            raise ValueError("crop scale must satisfy 0 < min <= max <= 1")
+        if not 0.0 <= occlusion_probability <= 1.0:
+            raise ValueError("occlusion_probability must be in [0, 1]")
+        if not 0.0 <= occlusion_min_ratio <= occlusion_max_ratio < 0.5:
+            raise ValueError("occlusion ratios must satisfy 0 <= min <= max < 0.5")
+        if not 1 <= occlusion_min_sides <= occlusion_max_sides <= 4:
+            raise ValueError("occlusion side counts must satisfy 1 <= min <= max <= 4")
 
         self.height = int(height)
         self.width = int(width)
+        self.images_subdir = images_subdir
+        self.depth_subdir = depth_subdir
         self.max_depth = float(max_depth)
-        self.gt_depth_scale = float(gt_depth_scale)
-        self.sparse_depth_scale = float(sparse_depth_scale)
-        self.err_thr = err_thr
-        self.nviews_thr = nviews_thr
+        self.depth_scale = float(depth_scale)
+        self.crop_scale_min = float(crop_scale_min)
+        self.crop_scale_max = float(crop_scale_max)
         self.random_flip = bool(random_flip)
-        self.min_sparse_points = int(min_sparse_points)
+        self.occlusion_probability = float(occlusion_probability)
+        self.occlusion_min_ratio = float(occlusion_min_ratio)
+        self.occlusion_max_ratio = float(occlusion_max_ratio)
+        self.occlusion_min_sides = int(occlusion_min_sides)
+        self.occlusion_max_sides = int(occlusion_max_sides)
 
-    def __len__(self):
-        return len(self.samples)
+        self.datasets: List[Dict] = []
+        self.total_pairs = 0
 
-    def __getitem__(self, index):
-        sample = self.samples[index]
+        for dataset_root in dataset_roots:
+            root = Path(dataset_root)
+            if not root.is_dir():
+                raise FileNotFoundError(dataset_root)
 
-        rgb = np.asarray(Image.open(sample["rgb"]).convert("RGB"))
-        gt_depth = _load_depth(sample["gt"], self.gt_depth_scale)
-        sparse_depth, err, nviews = _load_sparse_pack(sample["sparse"])
-        sparse_depth = sparse_depth * self.sparse_depth_scale
-        normal = _load_normal(sample["normal"])
+            scenes = []
+            # Search recursively so DATASET_ROOT may contain one extra grouping level.
+            for image_dir in root.rglob(images_subdir):
+                if not image_dir.is_dir() or image_dir.name != images_subdir:
+                    continue
+                scene_dir = image_dir.parent
+                depth_dir = scene_dir / depth_subdir
+                if not depth_dir.is_dir():
+                    continue
 
-        if self.err_thr is not None:
-            sparse_depth[err > self.err_thr] = 0.0
-        if self.nviews_thr is not None:
-            sparse_depth[nviews <= self.nviews_thr] = 0.0
-        if self.max_depth > 0:
-            sparse_depth[(sparse_depth > self.max_depth) | (sparse_depth < 0)] = 0.0
-            gt_depth[(gt_depth > self.max_depth) | (gt_depth < 0)] = 0.0
+                image_map = _file_map(image_dir, RGB_EXTENSIONS)
+                depth_map = _file_map(depth_dir, DEPTH_EXTENSIONS)
+                common = sorted(set(image_map) & set(depth_map))
+                if not common:
+                    continue
 
-        target_size = (self.width, self.height)
-        rgb = cv2.resize(rgb, target_size, interpolation=cv2.INTER_LINEAR)
-        gt_depth = cv2.resize(gt_depth, target_size, interpolation=cv2.INTER_NEAREST)
-        sparse_depth = cv2.resize(sparse_depth, target_size, interpolation=cv2.INTER_NEAREST)
-        normal = cv2.resize(normal, target_size, interpolation=cv2.INTER_LINEAR)
+                pairs = [
+                    {
+                        "stem": stem,
+                        "rgb": image_map[stem],
+                        "depth": depth_map[stem],
+                    }
+                    for stem in common
+                ]
+                scenes.append(
+                    {
+                        "name": str(scene_dir.relative_to(root)),
+                        "pairs": pairs,
+                    }
+                )
+                self.total_pairs += len(pairs)
 
-        normal_mag = np.linalg.norm(normal, axis=-1, keepdims=True)
-        normal = np.where(
-            normal_mag > 1e-6,
-            normal / np.maximum(normal_mag, 1e-6),
-            0.0,
-        )
+            if scenes:
+                self.datasets.append(
+                    {
+                        "name": root.name,
+                        "root": str(root),
+                        "scenes": scenes,
+                    }
+                )
 
-        if self.random_flip and np.random.rand() < 0.5:
-            rgb = np.ascontiguousarray(rgb[:, ::-1])
-            gt_depth = np.ascontiguousarray(gt_depth[:, ::-1])
-            sparse_depth = np.ascontiguousarray(sparse_depth[:, ::-1])
-            normal = np.ascontiguousarray(normal[:, ::-1])
-            # Horizontal image flip reverses camera/image-space normal x.
-            normal[..., 0] *= -1.0
-
-        sparse_valid = np.isfinite(sparse_depth) & (sparse_depth > 0)
-        if int(sparse_valid.sum()) < self.min_sparse_points:
+        if not self.datasets:
             raise RuntimeError(
-                f"Sample '{sample['stem']}' has only {int(sparse_valid.sum())} valid SfM points; "
-                f"at least {self.min_sparse_points} are required for Murre normalization."
+                "No valid training scenes found. Expected scene folders containing "
+                f"'{images_subdir}/' and '{depth_subdir}/' with matching filename stems."
             )
 
-        gt_valid = np.isfinite(gt_depth) & (gt_depth > 0)
+    def __len__(self):
+        # Sampling ignores the index, but a meaningful finite length lets DataLoader
+        # form epochs. The outer trainer simply starts a new iterator when needed.
+        return max(self.total_pairs, 1)
 
-        # Murre inference derives its normalization range from the sparse SfM depth.
-        sparse_norm, d_min, d_max = normalize_depth(
-            sparse_depth.copy(), pre_clip_max=self.max_depth
+    def _sample_pair(self):
+        dataset = random.choice(self.datasets)
+        scene = random.choice(dataset["scenes"])
+        pair = random.choice(scene["pairs"])
+        return dataset, scene, pair
+
+    def __getitem__(self, _index):
+        dataset, scene, pair = self._sample_pair()
+
+        rgb = np.asarray(Image.open(pair["rgb"]).convert("RGB"))
+        gt_depth = _load_depth(pair["depth"], self.depth_scale)
+
+        if self.max_depth > 0:
+            gt_depth[(gt_depth > self.max_depth) | (gt_depth < 0)] = 0.0
+
+        rgb, gt_depth = _random_crop_pair(
+            rgb=rgb,
+            depth=gt_depth,
+            target_height=self.height,
+            target_width=self.width,
+            crop_scale_min=self.crop_scale_min,
+            crop_scale_max=self.crop_scale_max,
         )
-        interp_norm, dist = interp_depth(sparse_norm)
+
+        if self.random_flip and random.random() < 0.5:
+            rgb = np.ascontiguousarray(rgb[:, ::-1])
+            gt_depth = np.ascontiguousarray(gt_depth[:, ::-1])
+
+        gt_valid = np.isfinite(gt_depth) & (gt_depth > 0)
+        if int(gt_valid.sum()) < 16:
+            # Extremely invalid frames are rare. Resample rather than returning a
+            # batch with no meaningful diffusion target.
+            return self.__getitem__(0)
+
+        # Simulated incomplete depth condition: start from the complete GT depth,
+        # then remove random border regions. The full GT remains the target.
+        input_depth = _apply_border_occlusion(
+            gt_depth,
+            min_ratio=self.occlusion_min_ratio,
+            max_ratio=self.occlusion_max_ratio,
+            min_sides=self.occlusion_min_sides,
+            max_sides=self.occlusion_max_sides,
+            probability=self.occlusion_probability,
+        )
+        observed = np.isfinite(input_depth) & (input_depth > 0)
+        if int(observed.sum()) < 3:
+            return self.__getitem__(0)
+
+        # Match Murre inference: the normalization range is determined only by the
+        # depth that remains visible after masking.
+        input_norm, d_min, d_max = normalize_depth(
+            input_depth.copy(), pre_clip_max=self.max_depth
+        )
+        interp_norm, dist = interp_depth(input_norm)
 
         depth_range = max(float(d_max - d_min), 1e-6)
-        gt_norm = (gt_depth - float(d_min)) / depth_range
-        gt_norm = np.clip(gt_norm, 0.0, 1.0)
+        gt_01 = np.clip((gt_depth - float(d_min)) / depth_range, 0.0, 1.0)
 
-        # VAE inputs follow Marigold/Murre convention: [-1, 1].
+        # Temporary normal prior: full GT depth -> normalized depth -> neighbour normal.
+        # This uses exactly the same normalized-depth convention as the predicted-depth
+        # normal loss, avoiding a scale mismatch in the image-space normal formula.
+        normal = _depth_to_normal(gt_01, gt_valid)
+
         rgb_norm = rgb.astype(np.float32) / 127.5 - 1.0
+        gt_norm = gt_01.astype(np.float32) * 2.0 - 1.0
         interp_norm = interp_norm.astype(np.float32) * 2.0 - 1.0
-        gt_norm = gt_norm.astype(np.float32) * 2.0 - 1.0
 
+        sample_name = f"{dataset['name']}/{scene['name']}/{pair['stem']}"
         return {
-            "stem": sample["stem"],
+            "stem": sample_name,
             "rgb_norm": torch.from_numpy(rgb_norm).permute(2, 0, 1).contiguous(),
             "gt_depth_norm": torch.from_numpy(gt_norm).unsqueeze(0).contiguous(),
             "gt_valid": torch.from_numpy(gt_valid).unsqueeze(0).bool(),
             "interp_depth_norm": torch.from_numpy(interp_norm).unsqueeze(0).contiguous(),
             "distance": torch.from_numpy(dist.astype(np.float32)).unsqueeze(0).contiguous(),
-            "normal": torch.from_numpy(normal.astype(np.float32)).permute(2, 0, 1).contiguous(),
-            # normal_consistency_loss only needs observed (>0) vs missing (<=0).
-            "sparse_observed": torch.from_numpy(sparse_valid.astype(np.float32)).unsqueeze(0).contiguous(),
+            "normal": torch.from_numpy(normal).permute(2, 0, 1).contiguous(),
+            # The normal loss uses this only as an observed/missing indicator:
+            # masked borders are fully supervised; observed interior keeps the
+            # lowest-loss 90% by default.
+            "sparse_observed": torch.from_numpy(observed.astype(np.float32)).unsqueeze(0).contiguous(),
             "d_min": torch.tensor(float(d_min), dtype=torch.float32),
             "d_max": torch.tensor(float(d_max), dtype=torch.float32),
         }
