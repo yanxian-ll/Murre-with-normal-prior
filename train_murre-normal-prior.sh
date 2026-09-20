@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Fine-tune local Murre with frozen, online Metric3D RGB -> normal predictions.
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT/.tools/murre-env/bin/python}"
+DATA_ROOT="${DATA_ROOT:-/mnt/nas/Mapanything_dataset/datasets_processed}"
+INDEX_PATH="${INDEX_PATH:-$ROOT/dataset/murre_normal_training_pairs.txt}"
+CHECKPOINT="${CHECKPOINT:-$ROOT/checkpoints/murre}"
+METRIC3D_CHECKPOINT="${METRIC3D_CHECKPOINT:-$ROOT/checkpoints/Metric3D/metric_depth_vit_large_800k.pth}"
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/output/murre-normal-prior}"
+RESOLUTIONS="${RESOLUTIONS:-128x192 192x256 256x384}" # HxW, same size within each batch
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
+MAX_STEPS="${MAX_STEPS:-10000}"
+LEARNING_RATE="${LEARNING_RATE:-3e-5}"
+NORMAL_WEIGHT="${NORMAL_WEIGHT:-0.1}"
+NORMAL_KEEP_RATIO="${NORMAL_KEEP_RATIO:-0.9}"
+METRIC3D_DEVICE="${METRIC3D_DEVICE:-cuda}"
+METRIC3D_MAX_EDGE="${METRIC3D_MAX_EDGE:-392}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
+MAX_RETRIES="${MAX_RETRIES:-1000}"
+MAX_DEPTH="${MAX_DEPTH:-0}" # 0: no absolute cap; use each frame's 99.5th percentile * 1.5
+PRECISION="${PRECISION:-bf16}"
+SAVE_EVERY="${SAVE_EVERY:-1000}"
+LOG_EVERY="${LOG_EVERY:-20}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-$OUTPUT_DIR/tensorboard}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES OPENCV_IO_ENABLE_OPENEXR=1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+read -r -a sizes <<< "$RESOLUTIONS"
+dry_run=false
+if [[ "${1:-}" == --dry-run ]]; then dry_run=true; shift; fi
+build=("$PYTHON_BIN" "$ROOT/dataset/build_murre_training_index.py" --root "$DATA_ROOT" --output "$INDEX_PATH")
+if [[ ! -s "$INDEX_PATH" || "${REBUILD_INDEX:-0}" == 1 ]]; then
+  printf '构建索引: '; printf '%q ' "${build[@]}"; printf '\n'
+  if ! "$dry_run"; then "${build[@]}"; fi
+fi
+cmd=("$PYTHON_BIN" "$ROOT/Murre-with-normal-prior/train.py"
+  --index "$INDEX_PATH" --checkpoint "$CHECKPOINT" --output_dir "$OUTPUT_DIR"
+  --normal_source metric3d --metric3d_checkpoint "$METRIC3D_CHECKPOINT"
+  --metric3d_device "$METRIC3D_DEVICE" --metric3d_max_edge "$METRIC3D_MAX_EDGE"
+  --resolutions "${sizes[@]}" --batch_size "$BATCH_SIZE" --gradient_accumulation_steps "$GRAD_ACCUM"
+  --max_steps "$MAX_STEPS" --learning_rate "$LEARNING_RATE" --num_workers "$NUM_WORKERS"
+  --max_retries "$MAX_RETRIES" --max_depth_mode auto --max_depth "$MAX_DEPTH"
+  --normal_weight "$NORMAL_WEIGHT" --normal_keep_ratio "$NORMAL_KEEP_RATIO"
+  --precision "$PRECISION" --gradient_checkpointing --random_flip --save_every "$SAVE_EVERY"
+  --log_every "$LOG_EVERY" --tensorboard_dir "$TENSORBOARD_DIR")
+if [[ -n "${RESUME:-}" ]]; then cmd+=(--resume "$RESUME"); fi
+cmd+=("$@")
+printf '训练命令: '; printf '%q ' "${cmd[@]}"; printf '\n'
+if "$dry_run"; then exit 0; fi
+exec "${cmd[@]}"

@@ -2,9 +2,37 @@
 
 `train.py` implements a Marigold-style Murre fine-tuning loop. The VAE and CLIP text encoder are frozen and only the Murre U-Net is optimized.
 
+## 本项目运行
+
+```bash
+# 查看参数（不构建索引、不训练）
+bash Murre-with-normal-prior/train_murre-normal-prior.sh --dry-run
+# 自动构建 TXT 索引，使用本地 Murre + Metric3D 权重训练
+bash Murre-with-normal-prior/train_murre-normal-prior.sh
+# 可调整大小、有效 batch size、步数和保存路径
+RESOLUTIONS="128x192 192x256" GRAD_ACCUM=4 MAX_STEPS=10000 \
+OUTPUT_DIR=output/murre-normal-prior-exp1 \
+bash Murre-with-normal-prior/train_murre-normal-prior.sh
+```
+
+默认 Python 为 `.tools/murre-env/bin/python`；可用 `PYTHON_BIN` 覆盖。
+Metric3D 额外依赖见 `requirements-metric3d.txt`，当前 `.tools/murre-env` 已安装并验证。
+索引 `dataset/murre_normal_training_pairs.txt` 为制表符分隔的
+`dataset / scene / rgb / depth / camera`，另有 `.summary.json`。
+默认包含 `/mnt/nas/Mapanything_dataset/datasets_processed` 下全部数据集，
+包括名称含 testsplit 的目录；需要独立测试集时，用索引生成器的 `--datasets` 选择训练数据。
+设置 `REBUILD_INDEX=1` 可重建。索引阶段不解码 depth，加载失败或有效像素不足时
+自动换样本；连续 `MAX_RETRIES=1000` 次失败才退出，防止坏数据导致无限等待。
+
+默认 `MAX_DEPTH=0`，按每帧有效深度分位数确定范围，不固定截断到 80 米。
+需要统一单位时传 `--depth_scales 数据集名=缩放系数`。
+`METRIC3D_DEVICE=cpu` 可节省显存但在线推理较慢。
+恢复示例：`RESUME=output/murre-normal-prior/checkpoint-0001000 bash Murre-with-normal-prior/train_murre-normal-prior.sh`。
+短测可传 `MAX_STEPS=1 GRAD_ACCUM=1 SAVE_EVERY=0` 和 `--skip_final_save`；正式训练不要跳过保存。
+
 ## Current training setup
 
-Training data is hierarchical: multiple datasets, each containing many scenes. Every scene only needs RGB images and dense depth.
+Training data is hierarchical: multiple datasets, each containing many scenes. Each scene needs RGB images, camera-Z depth, and matching `cams/<stem>.txt` pixel intrinsics.
 
 ```text
 DATASET_A/
@@ -50,15 +78,14 @@ RGB and depth receive the same random crop. The crop keeps the final training as
 [crop_scale_min, crop_scale_max]
 ```
 
-before being resized to `height x width`.
+before being resized to a randomly selected `--resolutions` size. All samples in one batch share the same size, including with multiple workers.
 
 Default:
 
 ```text
 crop_scale_min = 0.6
 crop_scale_max = 1.0
-height = 512
-width = 768
+resolutions = 128x192 192x256 256x384
 ```
 
 Optional horizontal flipping can be enabled with `--random_flip`.
@@ -99,19 +126,15 @@ complete RGB
 -> complete depth
 ```
 
-## Temporary normal prior
+## Online Metric3D normal prior
 
-No normal files are required for training right now.
-
-The current implementation computes the normal prior online from the **complete GT depth** after crop/resize. The depth is first normalized to the same `[0,1]` convention used by the prediction, then the normal is computed by central differences:
-
-```text
-normal = normalize([-dD/dx, -dD/dy, 1])
-```
-
-This intentionally matches `murre/util/normal_util.py`, which computes the normal from predicted depth in the same way.
-
-The trainer itself only consumes a tensor called `normal`, so this depth-derived prior can later be replaced by DSINE or another normal-estimation model without changing the diffusion training logic.
+The default prior is predicted from augmented RGB by the frozen local Metric3D model
+(`checkpoints/Metric3D/metric_depth_vit_large_800k.pth`). No normal files or downloads
+are needed. The main training process runs Metric3D after crop/resize/flip; data
+workers only read and augment RGB/depth/camera data. The normal loss back-projects
+predicted camera-Z depth using the correspondingly transformed camera intrinsics.
+`--normal_source gt_depth` is an explicit ablation that leaks GT geometry; it is not
+the training default.
 
 ## Model input
 
@@ -157,8 +180,7 @@ python train.py \
       /data/UAV_dataset_B \
       /data/UAV_dataset_C \
   --output_dir output/murre_normal \
-  --height 512 \
-  --width 768 \
+  --resolutions 128x192 192x256 256x384 \
   --max_depth 120 \
   --crop_scale_min 0.6 \
   --crop_scale_max 1.0 \
@@ -246,3 +268,24 @@ slant max delta         = 0.0 / 0.10 / 0.25 / 0.40
 ```
 
 The key evaluation split should separately report errors inside the synthetically masked region and the still-observed region.
+
+## 本机验证
+
+已使用本地 Murre/Metric3D 权重和 NAS EXR 完成 CUDA 短测：
+128×192 一步、默认变分辨率配合 2 个 worker 三步、256×384 一步；
+包含在线 normal、diffusion/normal loss、反向传播和 AdamW 更新，损失均有限。
+这些短测使用 `--skip_final_save`，没有生成正式训练模型，也不代表收敛验证。
+数据测试：`.tools/murre-env/bin/python -m unittest discover -s Murre-with-normal-prior/tests -v`。
+
+## TensorBoard 和文本日志
+
+默认保存到 `OUTPUT_DIR/tensorboard` 和 `OUTPUT_DIR/train.log`。记录 total、diffusion、
+normal、加权 normal loss、学习率和当前图像尺寸。loss 是上次记录以来所有 micro-batch 的均值，
+横轴为 optimizer step；默认第 1 步、每 20 步和最后一步记录，`LOG_EVERY=1` 可每步记录。
+`TENSORBOARD_DIR` 可指定事件文件目录。恢复训练继续原步数，并清除该目录中恢复点之后的旧事件显示。
+
+在项目根目录运行：
+```bash
+.tools/murre-env/bin/tensorboard --logdir output/murre-normal-prior/tensorboard --port 6006
+```
+浏览器打开 `http://localhost:6006`。训练正在运行时也可查看。
