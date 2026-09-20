@@ -262,7 +262,7 @@ def _apply_border_occlusion(
 
     sides = ["top", "bottom", "left", "right"]
     best = depth.copy()
-    best_visible = original_count
+    best_visible = -1
 
     for _ in range(max_attempts):
         occlusion_mask = np.zeros(depth.shape, dtype=np.uint8)
@@ -284,12 +284,12 @@ def _apply_border_occlusion(
 
         if visible_count >= min_visible:
             return candidate
-        if 0 < visible_count < best_visible:
+        if visible_count > best_visible:
             best = candidate
             best_visible = visible_count
 
     # Extremely aggressive combinations are retried above. If all attempts violate
-    # the minimum-visible constraint, use the least destructive valid candidate.
+    # the minimum-visible constraint, use the least destructive attempted candidate.
     if best_visible >= 3:
         return best
     return depth.copy()
