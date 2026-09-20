@@ -1,11 +1,9 @@
 import argparse
 import json
 import logging
-import math
 import os
 import random
 from contextlib import nullcontext
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,6 +25,13 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(_worker_id: int):
+    """Give each DataLoader worker an independent Python/NumPy RNG stream."""
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def get_autocast(device: torch.device, precision: str):
@@ -72,9 +77,7 @@ def prediction_to_x0(
     beta_bar = (1.0 - alpha_bar).clamp(0.0, 1.0)
 
     if prediction_type == "epsilon":
-        return (
-            noisy_latents - beta_bar.sqrt() * model_pred
-        ) / alpha_bar.sqrt()
+        return (noisy_latents - beta_bar.sqrt() * model_pred) / alpha_bar.sqrt()
     if prediction_type == "v_prediction":
         return alpha_bar.sqrt() * noisy_latents - beta_bar.sqrt() * model_pred
     raise ValueError(f"Unsupported prediction type: {prediction_type}")
@@ -91,7 +94,7 @@ def make_lr_scheduler(optimizer, max_steps: int, warmup_steps: int, final_ratio:
             return max(float(step + 1) / float(warmup_steps), 1e-8)
         denom = max(max_steps - warmup_steps, 1)
         progress = min(max((step - warmup_steps) / denom, 0.0), 1.0)
-        return final_ratio ** progress
+        return final_ratio**progress
 
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
@@ -103,7 +106,6 @@ def save_checkpoint(
     scaler,
     output_dir: str,
     global_step: int,
-    args,
 ):
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step:07d}")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -122,30 +124,53 @@ def save_checkpoint(
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Marigold-style Murre fine-tuning with an additional surface-normal prior."
+        description="Marigold-style Murre fine-tuning with depth-derived surface-normal prior."
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Original Murre checkpoint.")
     parser.add_argument("--resume", type=str, default=None, help="Resume from a saved checkpoint directory.")
     parser.add_argument("--output_dir", type=str, required=True)
 
-    parser.add_argument("--rgb_dir", type=str, required=True)
-    parser.add_argument("--gt_depth_dir", type=str, required=True)
-    parser.add_argument("--sparse_depth_dir", type=str, required=True)
-    parser.add_argument("--normal_dir", type=str, required=True)
+    parser.add_argument(
+        "--dataset_roots",
+        type=str,
+        nargs="+",
+        required=True,
+        help=(
+            "One or more dataset roots. Each root contains many scene folders; "
+            "every scene contains images/ and depth/ by default."
+        ),
+    )
+    parser.add_argument("--images_subdir", type=str, default="images")
+    parser.add_argument("--depth_subdir", type=str, default="depth")
+    parser.add_argument("--depth_scale", type=float, default=1.0)
 
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--max_depth", type=float, default=80.0)
+    parser.add_argument("--crop_scale_min", type=float, default=0.6)
+    parser.add_argument("--crop_scale_max", type=float, default=1.0)
+    parser.add_argument("--random_flip", action="store_true")
+
     parser.add_argument(
-        "--gt_depth_scale",
+        "--occlusion_probability",
         type=float,
         default=1.0,
-        help="Multiplier converting stored GT depth to meters, e.g. 0.001 for millimeters.",
+        help="Probability of applying simulated border occlusion to the input depth.",
     )
-    parser.add_argument("--sparse_depth_scale", type=float, default=1.0)
-    parser.add_argument("--err_thr", type=float, default=None)
-    parser.add_argument("--nviews_thr", type=int, default=None)
-    parser.add_argument("--random_flip", action="store_true")
+    parser.add_argument(
+        "--occlusion_min_ratio",
+        type=float,
+        default=0.05,
+        help="Minimum fraction masked from a selected image border.",
+    )
+    parser.add_argument(
+        "--occlusion_max_ratio",
+        type=float,
+        default=0.25,
+        help="Maximum fraction masked from a selected image border.",
+    )
+    parser.add_argument("--occlusion_min_sides", type=int, default=1)
+    parser.add_argument("--occlusion_max_sides", type=int, default=4)
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -167,7 +192,10 @@ def build_parser():
         "--normal_keep_ratio",
         type=float,
         default=0.9,
-        help="Observed-SfM pixels retained after dropping the highest normal-loss pixels.",
+        help=(
+            "For pixels where input depth remains visible, retain the lowest-loss "
+            "fraction for normal supervision. Border-masked pixels are all supervised."
+        ),
     )
 
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp16")
@@ -210,7 +238,7 @@ def main():
     pipe: MurrePipeline = MurrePipeline.from_pretrained(model_path, torch_dtype=torch.float32)
     pipe = pipe.to(device)
 
-    # Marigold training freezes the VAE and text encoder and optimizes only U-Net.
+    # Follow Marigold: freeze VAE + text encoder, optimize only U-Net.
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     pipe.unet.requires_grad_(True)
@@ -231,32 +259,48 @@ def main():
     empty_text_embed = pipe.empty_text_embed.detach().to(device=device, dtype=torch.float32)
 
     dataset = MurreNormalTrainingDataset(
-        rgb_dir=args.rgb_dir,
-        gt_depth_dir=args.gt_depth_dir,
-        sparse_depth_dir=args.sparse_depth_dir,
-        normal_dir=args.normal_dir,
+        dataset_roots=args.dataset_roots,
         height=args.height,
         width=args.width,
+        images_subdir=args.images_subdir,
+        depth_subdir=args.depth_subdir,
         max_depth=args.max_depth,
-        gt_depth_scale=args.gt_depth_scale,
-        sparse_depth_scale=args.sparse_depth_scale,
-        err_thr=args.err_thr,
-        nviews_thr=args.nviews_thr,
+        depth_scale=args.depth_scale,
+        crop_scale_min=args.crop_scale_min,
+        crop_scale_max=args.crop_scale_max,
         random_flip=args.random_flip,
+        occlusion_probability=args.occlusion_probability,
+        occlusion_min_ratio=args.occlusion_min_ratio,
+        occlusion_max_ratio=args.occlusion_max_ratio,
+        occlusion_min_sides=args.occlusion_min_sides,
+        occlusion_max_sides=args.occlusion_max_sides,
     )
     loader_generator = torch.Generator().manual_seed(args.seed)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,  # __getitem__ performs hierarchical random sampling itself.
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
         generator=loader_generator,
+        worker_init_fn=seed_worker,
+        persistent_workers=args.num_workers > 0,
     )
-    logging.info("Training samples: %d", len(dataset))
+    n_scenes = sum(len(d["scenes"]) for d in dataset.datasets)
+    logging.info(
+        "Training hierarchy: %d datasets, %d scenes, %d matched image/depth pairs",
+        len(dataset.datasets),
+        n_scenes,
+        dataset.total_pairs,
+    )
+    logging.info(
+        "Sampling policy: uniform dataset -> uniform scene -> uniform image; crop_scale=[%.2f, %.2f]",
+        args.crop_scale_min,
+        args.crop_scale_max,
+    )
 
-    # Marigold uses a DDPM scheduler for the forward diffusion training process.
+    # Marigold uses DDPM for the training forward diffusion process.
     training_noise_scheduler = DDPMScheduler.from_config(
         pipe.scheduler.config,
         rescale_betas_zero_snr=True,
@@ -333,7 +377,7 @@ def main():
         ).long()
 
         with get_autocast(device, args.precision):
-            # Frozen encoders exactly mirror Marigold: no gradient through RGB/GT encodings.
+            # Frozen encoders mirror Marigold: no gradient through RGB/GT/input-depth encodings.
             with torch.no_grad():
                 rgb_latent = pipe.encode_rgb(rgb)
                 gt_latent = encode_depth(pipe, gt_depth)
@@ -353,9 +397,14 @@ def main():
                 mode="bilinear",
                 align_corners=False,
             )
-            normal_down = F.normalize(normal_down, p=2, dim=1, eps=1e-6)
+            normal_mag = torch.linalg.vector_norm(normal_down, dim=1, keepdim=True)
+            normal_down = torch.where(
+                normal_mag > 1e-6,
+                normal_down / normal_mag.clamp_min(1e-6),
+                torch.zeros_like(normal_down),
+            )
 
-            # Preserve the 13 original Murre channels and append 3 normal channels.
+            # Original 13 Murre channels + 3 normal-prior channels.
             unet_input = torch.cat(
                 [rgb_latent, interp_latent, distance_down, noisy_latent, normal_down],
                 dim=1,
@@ -391,8 +440,8 @@ def main():
                     training_noise_scheduler,
                     prediction_type,
                 )
-                # VAE parameters are frozen, but this decode must NOT be wrapped in no_grad:
-                # the normal loss needs a gradient path back to the U-Net prediction.
+                # VAE weights are frozen, but decoding keeps autograd on the latent so
+                # the normal loss can back-propagate into the U-Net.
                 pred_depth = pipe.decode_depth(pred_x0)
                 pred_depth_01 = (pred_depth.clamp(-1.0, 1.0) + 1.0) * 0.5
                 normal_loss = normal_consistency_loss(
@@ -468,11 +517,11 @@ def main():
                 scaler,
                 args.output_dir,
                 global_step,
-                args,
             )
 
     progress.close()
     final_dir = os.path.join(args.output_dir, "final")
+    os.makedirs(final_dir, exist_ok=True)
     pipe.save_pretrained(final_dir)
     torch.save(
         {
