@@ -8,7 +8,11 @@ DATA_ROOT="${DATA_ROOT:-/mnt/nas/Mapanything_dataset/datasets_processed}"
 INDEX_PATH="${INDEX_PATH:-$ROOT/dataset/murre_normal_training_pairs.txt}"
 CHECKPOINT="${CHECKPOINT:-$ROOT/checkpoints/murre}"
 METRIC3D_CHECKPOINT="${METRIC3D_CHECKPOINT:-$ROOT/checkpoints/Metric3D/metric_depth_vit_large_800k.pth}"
-OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/output/murre-normal-prior-b16}"
+NORMAL_SOURCE="${NORMAL_SOURCE:-gt_depth}"
+NORMAL_TAG="${NORMAL_SOURCE//_/-}"
+# Keep different normal-source experiments in different default directories so
+# AUTO_RESUME cannot silently mix an old Metric3D run with a new GT-depth run.
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/output/murre-${NORMAL_TAG}-normal-prior-b16}"
 RESOLUTIONS="${RESOLUTIONS:-192x256 256x384}" # HxW, same size within each batch
 # Resize RGB/depth together before cropping; K follows both transforms.
 WORK_RESOLUTION="${WORK_RESOLUTION:-384}" # longest edge before crop
@@ -18,7 +22,6 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
-NORMAL_SOURCE="${NORMAL_SOURCE:-gt_depth}"
 NORMAL_WEIGHT="${NORMAL_WEIGHT:-0.1}"
 NORMAL_KEEP_RATIO="${NORMAL_KEEP_RATIO:-0.9}"
 MIN_GT_VALID_RATIO="${MIN_GT_VALID_RATIO:-0.9}"
